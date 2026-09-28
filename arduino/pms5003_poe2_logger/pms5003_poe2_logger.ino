@@ -984,21 +984,21 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   --line-soft:#f1f2f4; --hover:#fafbfc;
   --accent:#2563eb; --accent-dark:#1d4ed8; --accent-soft:#eef4ff;
   --ok:#15803d; --warn:#b45309; --err:#b91c1c;
-  --pm1:#16a34a; --pm25:#ea580c; --pm10:#dc2626; --temp:#7c3aed; --hum:#0891b2;
+  --pm1:#16a34a; --pm25:#ea580c; --pm10:#dc2626; --temp:#7c3aed; --hum:#0891b2; --dew:#0284c7;
   --r:14px; --sh:0 1px 2px rgba(16,24,40,.05),0 10px 28px rgba(16,24,40,.06);
 }
 body.theme-dark{
   --bg:#0f1319; --card:#171d26; --text:#e7ebf2; --muted:#94a3b8; --line:#252d3a;
   --line-soft:#1f2733; --hover:#1d2430;
   --accent:#4f8cff; --accent-dark:#3a74e6; --accent-soft:#1b2534;
-  --pm1:#22c55e; --pm25:#f97316; --pm10:#ef4444; --temp:#a78bfa; --hum:#22d3ee;
+  --pm1:#22c55e; --pm25:#f97316; --pm10:#ef4444; --temp:#a78bfa; --hum:#22d3ee; --dew:#38bdf8;
   --sh:0 1px 2px rgba(0,0,0,.5),0 12px 30px rgba(0,0,0,.45);
 }
 body.theme-contrast{
   --bg:#000000; --card:#000000; --text:#ffffff; --muted:#ffd400; --line:#ffffff;
   --line-soft:#3a3a3a; --hover:#141414;
   --accent:#00e5ff; --accent-dark:#00b8cc; --accent-soft:#00323a;
-  --pm1:#00ff66; --pm25:#ffcc00; --pm10:#ff3b30; --temp:#c084fc; --hum:#22d3ee;
+  --pm1:#00ff66; --pm25:#ffcc00; --pm10:#ff3b30; --temp:#c084fc; --hum:#22d3ee; --dew:#38bdf8;
   --sh:none;
 }
 body.theme-contrast .card,body.theme-contrast .val{border-width:2px}
@@ -1037,6 +1037,7 @@ canvas{width:100%;height:320px;display:block;border:1px solid var(--line);border
 #cvals .val:nth-child(3){border-top-color:var(--pm10)}
 #cvals .val:nth-child(4){border-top-color:var(--temp)}
 #cvals .val:nth-child(5){border-top-color:var(--hum)}
+#cvals .val:nth-child(6){border-top-color:var(--dew)}
 table{border-collapse:separate;border-spacing:0;width:100%;font-size:13.5px}
 th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--line)}
 td{padding:9px 10px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
@@ -1111,6 +1112,7 @@ tbody tr:last-child td{border-bottom:none}
     <div class="val"><div class="muted">PM10</div><div class="big" id="c10">-</div></div>
     <div class="val"><div class="muted">Temperature &deg;C</div><div class="big" id="ctemp">-</div></div>
     <div class="val"><div class="muted">Humidity %</div><div class="big" id="chum">-</div></div>
+    <div class="val"><div class="muted">Dew point &deg;C</div><div class="big" id="cdew">-</div></div>
   </div>
   <div class="muted" id="cupd">-</div>
 </div>
@@ -1164,6 +1166,26 @@ tbody tr:last-child td{border-bottom:none}
         <tr><td>Dense smoke, close range</td><td>1000 - 10000+</td></tr>
         <tr><td>Developed fire in a room</td><td>tens of thousands (sensor saturated)</td></tr>
       </table>
+
+      <h3>Temperature / humidity reference (AM2302)</h3>
+      <table>
+        <tr><th>Condition</th><th>Value</th></tr>
+        <tr><td>Comfortable living space</td><td>20 - 24 &deg;C, 40 - 60 % RH</td></tr>
+        <tr><td>Too dry (dry eyes and throat, static)</td><td>below 30 % RH</td></tr>
+        <tr><td>Too humid (mould risk)</td><td>above 60 % RH, high above 70 %</td></tr>
+        <tr><td>Condensation on cold surfaces</td><td>dew point within ~3 &deg;C of the surface</td></tr>
+      </table>
+      <ul>
+        <li><b>Dew point:</b> below 10 &deg;C comfortable, 16 - 20 &deg;C muggy,
+            above 20 &deg;C oppressive.</li>
+        <li><b>Sensor accuracy:</b> AM2302 is specified as &plusmn;0.5 &deg;C and
+            &plusmn;2 - 5 % RH, with a resolution of 0.1.</li>
+        <li><b>Polling:</b> it is read every 3 s here; do not poll it faster than
+            once every 2 s.</li>
+        <li><b>Mould:</b> grows when relative humidity next to a surface stays above
+            ~80 % for days - watch the dew point, not only the RH.</li>
+        <li><b>Note:</b> the AM2302 is not suitable for condensing environments.</li>
+      </ul>
 
       <h3>PMS5003 sensor limits</h3>
       <ul>
@@ -1371,6 +1393,8 @@ function pollCurrent(){
       q("c10").textContent = s.current.pm100;
       q("ctemp").textContent = (s.current.temp === null || s.current.temp === undefined) ? "-" : s.current.temp;
       q("chum").textContent  = (s.current.hum  === null || s.current.hum  === undefined) ? "-" : s.current.hum;
+      q("cdew").textContent  = (s.current.temp === null || s.current.temp === undefined || s.current.hum === null || s.current.hum === undefined)
+                               ? "-" : dewPoint(parseFloat(s.current.temp), parseFloat(s.current.hum)).toFixed(1);
     }
     q("cupd").textContent = "read at: " + s.time + " (every 5 s)";
   }).catch(function(){});
@@ -1569,6 +1593,14 @@ function drawChart(g, L, T, pw, ph, data, fs, lw){
   });
 }
 
+/* Magnus formula dew point in degC from temperature (degC) and RH (%) */
+function dewPoint(tc, rh){
+  if (!(rh > 0)) return 0;
+  var a = 17.27, b = 237.7;
+  var al = Math.log(rh / 100.0) + (a * tc) / (b + tc);
+  return (b * al) / (a - al);
+}
+
 /* Second chart: temperature and humidity (Y axis 0..100 covers % and degC) */
 function drawEnvChart(g, L, T, pw, ph, data, fs, lw){
   g.font = fs + "px Arial";
@@ -1583,38 +1615,47 @@ function drawEnvChart(g, L, T, pw, ph, data, fs, lw){
 
   var xmin = data[0][0], xmax = data[data.length-1][0];
   if (xmax <= xmin) xmax = xmin + 1;
-  var ymax = 100, i, v, t, x, y;
+
+  /* temperature has its own auto-scaled left axis, humidity a fixed 0..100 right axis */
+  var tlo = d[0][4], thi = d[0][4], i, y;
+  d.forEach(function(r){ tlo = Math.min(tlo, r[4]); thi = Math.max(thi, r[4]); });
+  tlo = Math.floor(tlo - 1);
+  thi = Math.ceil(thi + 1);
+  if (thi - tlo < 4) { tlo -= 2; thi = tlo + 4; }
+  var hlo = 0, hhi = 100;
 
   function X(tt){ return L + (tt - xmin) * pw / (xmax - xmin); }
-  function Y(vv){ return T + ph - vv * ph / ymax; }
+  function YT(vv){ return T + ph - (vv - tlo) * ph / (thi - tlo); }
+  function YH(vv){ return T + ph - (vv - hlo) * ph / (hhi - hlo); }
 
   g.strokeStyle = pal.grid;
-  g.fillStyle = pal.label;
   g.lineWidth = 1;
   for (i = 0; i <= 4; i++) {
-    v = ymax * i / 4; y = Y(v);
+    y = T + ph - ph * i / 4;
     g.beginPath(); g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke();
-    g.textAlign = "right"; g.fillText(v.toFixed(0), L - 6, y + fs*0.35);
+    g.fillStyle = pal.temp; g.textAlign = "right";
+    g.fillText((tlo + (thi - tlo) * i / 4).toFixed(1), L - 6, y + fs*0.35);
+    g.fillStyle = pal.hum; g.textAlign = "left";
+    g.fillText((hlo + (hhi - hlo) * i / 4).toFixed(0), L + pw + 8, y + fs*0.35);
   }
   for (i = 0; i <= 4; i++) {
-    t = xmin + (xmax - xmin) * i / 4; x = X(t);
-    g.beginPath(); g.moveTo(x, T); g.lineTo(x, T + ph); g.stroke();
-    g.textAlign = "center"; g.fillText(fmtAxis(Math.round(t), xmax - xmin), x, T + ph + fs + 4);
+    var tt = xmin + (xmax - xmin) * i / 4;
+    var xx = X(tt);
+    g.beginPath(); g.moveTo(xx, T); g.lineTo(xx, T + ph); g.stroke();
+    g.fillStyle = pal.label; g.textAlign = "center";
+    g.fillText(fmtAxis(Math.round(tt), xmax - xmin), xx, T + ph + fs + 4);
   }
   g.strokeStyle = pal.axis;
   g.beginPath(); g.moveTo(L, T); g.lineTo(L, T + ph); g.lineTo(L + pw, T + ph); g.stroke();
 
-  g.save();
-  g.translate(fs * 0.95, T + ph / 2);
-  g.rotate(-Math.PI / 2);
-  g.textAlign = "center";
-  g.fillStyle = pal.label;
-  g.fillText("\u00b0C / %", 0, 0);
-  g.restore();
+  g.fillStyle = pal.temp; g.textAlign = "left";
+  g.fillText("\u00b0C", 6, T + 10);
+  g.fillStyle = pal.hum; g.textAlign = "right";
+  g.fillText("%", L + pw + 34, T + 10);
 
   var series = [
-    {idx:4, col:pal.temp, name:"Temperature \u00b0C"},
-    {idx:5, col:pal.hum,  name:"Humidity %"}
+    {idx:4, col:pal.temp, name:"Temperature \u00b0C", Y:YT},
+    {idx:5, col:pal.hum,  name:"Humidity %",      Y:YH}
   ];
 
   series.forEach(function(s){
@@ -1625,7 +1666,7 @@ function drawEnvChart(g, L, T, pw, ph, data, fs, lw){
     d.forEach(function(r){
       var vv = r[s.idx];
       if (vv === null || vv === undefined) { prvi = true; return; }
-      var px = X(r[0]), py = Y(vv);
+      var px = X(r[0]), py = s.Y(vv);
       if (prvi) { g.moveTo(px, py); prvi = false; } else { g.lineTo(px, py); }
     });
     g.stroke();
@@ -1634,7 +1675,7 @@ function drawEnvChart(g, L, T, pw, ph, data, fs, lw){
       var vv = r[s.idx];
       if (vv === null || vv === undefined) return;
       g.beginPath();
-      g.arc(X(r[0]), Y(vv), lw + 0.6, 0, 6.2832);
+      g.arc(X(r[0]), s.Y(vv), lw + 0.6, 0, 6.2832);
       g.fill();
     });
   });
@@ -1644,7 +1685,7 @@ function drawEnvChart(g, L, T, pw, ph, data, fs, lw){
     g.fillStyle = s.col; g.fillRect(lx, T - fs*1.4, fs*0.9, fs*0.9);
     g.fillStyle = pal.text; g.textAlign = "left";
     g.fillText(s.name, lx + fs*1.2, T - fs*0.5);
-    lx += fs * 11;
+    lx += fs * 12;
   });
 }
 
@@ -1676,8 +1717,22 @@ function draw(){
   var ge = cve.getContext("2d");
   ge.setTransform(dpr,0,0,dpr,0,0);
   ge.clearRect(0,0,we,he);
-  drawEnvChart(ge, 52, 26, we-52-10, he-26-28, d, 12, 2);
-  var withEnv = d.filter(function(r){ return r[4] !== null && r[4] !== undefined; }).length;
+  drawEnvChart(ge, 52, 26, we-52-46, he-26-28, d, 12, 2);
+  var envRows = d.filter(function(r){ return r[4] !== null && r[4] !== undefined; });
+  var envTxt = "temperature / humidity: " + envRows.length + " of " + d.length + " records";
+  if (envRows.length) {
+    var tmin = envRows[0][4], tmax = envRows[0][4], hmin = envRows[0][5], hmax = envRows[0][5], ts = 0, hs = 0;
+    envRows.forEach(function(r){
+      tmin = Math.min(tmin, r[4]); tmax = Math.max(tmax, r[4]);
+      hmin = Math.min(hmin, r[5]); hmax = Math.max(hmax, r[5]);
+      ts += r[4]; hs += r[5];
+    });
+    var tavg = ts / envRows.length, havg = hs / envRows.length;
+    envTxt += "  |  temp min/avg/max: " + tmin.toFixed(1) + " / " + tavg.toFixed(1) + " / " + tmax.toFixed(1) + " \u00b0C";
+    envTxt += "  |  humidity min/avg/max: " + hmin.toFixed(1) + " / " + havg.toFixed(1) + " / " + hmax.toFixed(1) + " %";
+    envTxt += "  |  dew point (avg): " + dewPoint(tavg, havg).toFixed(1) + " \u00b0C";
+  }
+  q("chartinfoEnv").textContent = envTxt;
   q("chartinfoEnv").textContent = "temperature / humidity: " + withEnv + " of " + d.length + " records";
 }
 
@@ -1701,7 +1756,7 @@ function exportPNG(){
 
   g.fillStyle = pal.text; g.font = "bold 16px Arial"; g.textAlign = "left";
   g.fillText("Temperature / humidity", 24, 480);
-  drawEnvChart(g, 70, 505, w - 70 - 40, 320, d, 14, 2.4);
+  drawEnvChart(g, 70, 505, w - 70 - 60, 320, d, 14, 2.4);
 
   var a = document.createElement("a");
   var ts = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);

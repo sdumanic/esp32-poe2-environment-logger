@@ -50,6 +50,11 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
 - History queries read **all files covering the selected range**, merge and sort
   them, and decimate evenly when there are more than 3000 records.
 - The file list shows the newest 15 files per page with page navigation.
+- The environment chart uses two axes (temperature on the left with an auto
+  range, humidity 0-100 % on the right) and the caption shows min/avg/max plus
+  the dew point; the current dew point is also shown on a tile.
+- The help modal includes reference values for temperature, humidity and dew
+  point (comfort, mould risk, condensation).
 - Three selectable themes: light, dark and high contrast (chart and PNG export
   follow the selected theme).
 - **Administration** at `/admin`: network settings (Ethernet, AP, NTP), manual
