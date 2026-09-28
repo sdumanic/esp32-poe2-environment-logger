@@ -18,6 +18,7 @@ the sensor freshness indicator, and the file list with download/delete actions.*
 | Ethernet | LAN8720: PHY addr 0, MDC=GPIO23, MDIO=GPIO18, POWER=GPIO12, CLK=GPIO0 |
 | microSD | onboard slot, 1-bit SDMMC: CLK=GPIO14, CMD=GPIO15, D0=GPIO2 |
 | PMS5003 | VCC=5V, GND, TX=GPIO33 (board RX), RX=GPIO13 (board TX, optional) |
+| AM2302 (DHT22) | temperature + humidity, DATA=GPIO4 (EXT1 pin 19), VCC=**3.3V**, GND, 10 kOhm pull-up DATA-3.3V |
 | Wi-Fi | softAP, default `esp32-poe2-pms` |
 
 Pins not to use: GPIO16/17 (PSRAM), GPIO18/23 (Ethernet), GPIO12 (PHY power),
@@ -29,10 +30,13 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
 
 ## Features
 
+- AM2302 / DHT22 temperature and humidity are read every 3 s (bit-banged, no
+  external library) and logged in the same CSV rows; they are drawn in a second
+  chart and shown in the current-value tiles.
 - PMS5003 is read over `Serial2` (9600 8N1), 32-byte frames with the `0x42 0x4D`
   header and a checksum; the parser re-syncs on the header and counts accepted
   and rejected frames.
-- CSV logging **only when PM2.5 or PM10 changes**.
+- CSV logging **only when PM2.5, PM10, temperature or humidity changes**.
 - One file per creation date and time: `/pms_YYYYMMDD_HHMMSS.csv`, with
   **automatic rotation at midnight** and no board restart.
 - Time: **NTP** when the network is available, **MANUAL** when set from the
@@ -109,6 +113,32 @@ curl -F "firmware=@pms5003_poe2_logger.ino.bin" http://<board_IP>/update
 | `arduino/pms5003_poe2_logger` | main sketch: PMS5003 + SD + NTP + web + AP + OTA |
 | `arduino/esp32_poe_test` | minimal test: blink + serial output |
 | `arduino/esp32_poe_eth_test` | Ethernet test (LAN8720, DHCP) |
+
+## EXT1 connector pinout (Olimex ESP32-POE2)
+
+Taken from the Olimex KiCad design files (`ESP32-PoE2_Rev_B.kicad_pcb`):
+
+| EXT1 pin | Signal | EXT1 pin | Signal |
+|---|---|---|---|
+| 1 | VPP | 14 | GPIO35 |
+| 2 | GND | 15 | GPIO2 (SD DATA0) |
+| 3 | +5VP | 16 | GPIO34 (BUT1) |
+| 4 | GND | 17 | GPIO3 (U0RXD) |
+| 5 | +5V | 18 | GPIO33 |
+| 6 | GND | **19** | **GPIO4 (U1TXD)** |
+| 7 | +3.3V | 20 | GPIO32 |
+| 8 | GND | 21 | GPIO5 (SPI_CS) |
+| 9 | ESP_EN | 22 | GPIO16 (I2C SCL - PSRAM on POE2, do not use) |
+| 10 | GPIO39 | 23 | GPIO12 (PHY power - do not use) |
+| 11 | GPIO0 | 24 | GPIO15 (SD CMD) |
+| 12 | GPIO36 (U1RXD) | 25 | GPIO13 (I2C SDA) |
+| 13 | GPIO1 (U0TXD) | 26 | GPIO14 (SD CLK) |
+
+Wiring used in this project: PMS5003 on GPIO33/GPIO13 (pins 18/25), AM2302 data
+on GPIO4 (pin 19), AM2302 VCC on pin 7 (3.3 V), GND on pins 2/4/6/8.
+
+> The AM2302 must be powered from **3.3 V** (pin 7). With 5 V the data line would
+> swing to 5 V, which the ESP32 is not tolerant of.
 
 ## Defaults
 

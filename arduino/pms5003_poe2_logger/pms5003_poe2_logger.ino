@@ -1,4 +1,4 @@
-/*
+﻿/*
   ESP32-POE2 + PMS5003 + microSD + NTP + web server + Wi-Fi AP
   ============================================================
 
@@ -88,6 +88,10 @@
 #define PMS_RX_PIN   33     // ESP32 RX  <- PMS5003 TX
 #define PMS_TX_PIN   13     // ESP32 TX  -> PMS5003 RX (optional)
 #define PMS_BAUD     9600
+
+// ---- AM2302 / DHT22 (temperature + humidity) ----
+#define DHT_PIN        4       // DATA on EXT1/UEXT (free in this project)
+#define DHT_READ_MS    3000    // sensor supports ~0.5 Hz max
 
 // ---- Time zone ----
 // The "timestamp" CSV column is always a Unix epoch in UTC; the time zone is
@@ -209,6 +213,17 @@ static uint32_t    netStartMs   = 0;
 static uint32_t    framesOk  = 0;   // valid 32-byte frames
 static uint32_t    framesBad = 0;   // frames with bad header/checksum
 
+// ---- AM2302 state ----
+static float    dhtTempC   = NAN;
+static float    dhtHumidity = NAN;
+static uint32_t dhtLastGoodMs = 0;
+static uint32_t dhtGood = 0;
+static uint32_t dhtBad  = 0;
+static bool     dhtEverOk = false;
+static uint32_t lastDhtRead = 0;
+static float    lastWrittenTemp = NAN;
+static float    lastWrittenHum  = NAN;
+
 // ---- Daily file rotation ----
 static int         rotDay    = -1;
 static int         rotMonth  = -1;
@@ -223,6 +238,8 @@ struct LogRow {
   uint16_t pm1;
   uint16_t pm25;
   uint16_t pm100;
+  float    temp;
+  float    hum;
 };
 
 static LogRow  ring[RING_MAX];
@@ -352,7 +369,7 @@ static void ringReset(const String &file) {
   ringValid = true;
 }
 
-static void ringPush(uint32_t ts, uint16_t a, uint16_t b, uint16_t c) {
+static void ringPush(uint32_t ts, uint16_t a, uint16_t b, uint16_t c, float tf, float hf) {
   int idx;
   if (ringCount < RING_MAX) {
     idx = (ringHead + ringCount) % RING_MAX;
@@ -365,6 +382,8 @@ static void ringPush(uint32_t ts, uint16_t a, uint16_t b, uint16_t c) {
   ring[idx].pm1   = a;
   ring[idx].pm25  = b;
   ring[idx].pm100 = c;
+  ring[idx].temp  = tf;
+  ring[idx].hum   = hf;
 }
 
 // Loads a CSV file into the ring (last RING_MAX records). If the ring already
@@ -391,8 +410,11 @@ static bool loadIntoRing(const String &file) {
     unsigned long ts = 0;
     unsigned a = 0, b = 0, c = 0;
     char source[16] = {0};
-    if (sscanf(line.c_str(), "%lu,%15[^,],%u,%u,%u", &ts, source, &a, &b, &c) == 5) {
-      ringPush((uint32_t)ts, (uint16_t)a, (uint16_t)b, (uint16_t)c);
+    float tf = NAN, hf = NAN;
+    int parsed = sscanf(line.c_str(), "%lu,%15[^,],%u,%u,%u,%f,%f",
+                         &ts, source, &a, &b, &c, &tf, &hf);
+    if (parsed >= 5) {
+      ringPush((uint32_t)ts, (uint16_t)a, (uint16_t)b, (uint16_t)c, tf, hf);
     }
   }
   f.close();
@@ -549,13 +571,18 @@ static bool loadHistoryRange(uint32_t from, uint32_t till) {
       unsigned long ts = 0;
       unsigned a = 0, b = 0, c = 0;
       char source[16] = {0};
-      if (sscanf(line.c_str(), "%lu,%15[^,],%u,%u,%u", &ts, source, &a, &b, &c) == 5) {
+      float tf = NAN, hf = NAN;
+      int parsed = sscanf(line.c_str(), "%lu,%15[^,],%u,%u,%u,%f,%f",
+                           &ts, source, &a, &b, &c, &tf, &hf);
+      if (parsed >= 5) {
         if ((from == 0 || ts >= from) && (till == 0 || ts <= till)) {
           LogRow r;
           r.ts    = (uint32_t)ts;
           r.pm1   = (uint16_t)a;
           r.pm25  = (uint16_t)b;
           r.pm100 = (uint16_t)c;
+          r.temp  = tf;
+          r.hum   = hf;
           histPush(r);
         }
       }
@@ -619,7 +646,7 @@ static bool prepareCsv() {
     SLOG.println(csvPath);
     return false;
   }
-  f.println("timestamp,time_source,pm1_0,pm2_5,pm10");
+  f.println("timestamp,time_source,pm1_0,pm2_5,pm10,temp_c,humidity");
   f.close();
   SLOG.print("[SD] Created file with header: ");
   SLOG.println(csvPath);
@@ -679,7 +706,8 @@ static void checkRotation() {
 }
 
 static bool writeRow(uint32_t ts, const char *source,
-                     uint16_t pm1, uint16_t pm25, uint16_t pm100) {
+                     uint16_t pm1, uint16_t pm25, uint16_t pm100,
+                     float temp, float hum) {
   if (sdFs == nullptr) {
     return false;
   }
@@ -694,12 +722,20 @@ static bool writeRow(uint32_t ts, const char *source,
   f.print(source);  f.print(',');
   f.print(pm1);     f.print(',');
   f.print(pm25);    f.print(',');
-  f.println(pm100);
+  f.print(pm100);
+  if (dhtEverOk) {
+    f.print(",");   f.print(temp, 1);
+    f.print(",");   f.print(hum, 1);
+  } else {
+    f.print(",");
+    f.print(",");
+  }
+  f.println();
   f.close();
   recordCount++;
 
   if (ringValid && ringFile == String(csvPath)) {
-    ringPush(ts, pm1, pm25, pm100);
+    ringPush(ts, pm1, pm25, pm100, temp, hum);
   }
   return true;
 }
@@ -760,6 +796,59 @@ static bool readPmsData(Stream *s) {
   }
 
   return false;
+}
+
+// ============================== AM2302 (DHT22) ==============================
+
+// Bit-banged read of one 40-bit frame. The sensor needs a >=1 ms low pulse to
+// start, then sends 40 bits (16 hum, 16 temp, 8 checksum). Interrupts are
+// disabled during the transfer because the bit timing is ~30 us.
+static bool readDht22(float &tempC, float &humidity) {
+  uint8_t data[5] = {0, 0, 0, 0, 0};
+
+  pinMode(DHT_PIN, OUTPUT);
+  digitalWrite(DHT_PIN, LOW);
+  delay(2);                       // start signal (>= 1 ms)
+  digitalWrite(DHT_PIN, HIGH);
+  delayMicroseconds(30);
+  pinMode(DHT_PIN, INPUT_PULLUP);
+
+  noInterrupts();
+
+  // sensor response: ~80 us low, then ~80 us high
+  uint32_t t = micros();
+  while (digitalRead(DHT_PIN) == HIGH) { if (micros() - t > 200) { interrupts(); return false; } }
+  t = micros();
+  while (digitalRead(DHT_PIN) == LOW)  { if (micros() - t > 200) { interrupts(); return false; } }
+  t = micros();
+  while (digitalRead(DHT_PIN) == HIGH) { if (micros() - t > 200) { interrupts(); return false; } }
+
+  // 40 data bits: 50 us low, then 26-28 us (0) or ~70 us (1) high
+  for (int i = 0; i < 40; i++) {
+    t = micros();
+    while (digitalRead(DHT_PIN) == LOW)  { if (micros() - t > 100) { interrupts(); return false; } }
+    t = micros();
+    while (digitalRead(DHT_PIN) == HIGH) { if (micros() - t > 100) { interrupts(); return false; } }
+    uint32_t highUs = micros() - t;
+    data[i / 8] <<= 1;
+    if (highUs > 45) {
+      data[i / 8] |= 1;
+    }
+  }
+
+  interrupts();
+
+  uint8_t sum = data[0] + data[1] + data[2] + data[3];
+  if (sum != data[4]) {
+    return false;
+  }
+
+  uint16_t rawHum  = ((uint16_t)data[0] << 8) | data[1];
+  uint16_t rawTemp = ((uint16_t)data[2] << 8) | data[3];
+  humidity = rawHum / 10.0f;
+  tempC    = (rawTemp & 0x8000) ? -((rawTemp & 0x7FFF) / 10.0f)
+                                :  (rawTemp / 10.0f);
+  return true;
 }
 
 // ============================== NETWORK ==============================
@@ -857,15 +946,19 @@ static void handleSample() {
   lastPm25  = pm25;
   lastPm100 = pm100;
 
-  bool changed = (pm25 != lastWrittenPm25) || (pm100 != lastWrittenPm100);
+  bool changed = (pm25 != lastWrittenPm25) || (pm100 != lastWrittenPm100) ||
+                 (!isnan(dhtTempC)    && dhtTempC    != lastWrittenTemp) ||
+                 (!isnan(dhtHumidity) && dhtHumidity != lastWrittenHum);
 
   if (changed) {
     if (!sdReady) {
       sdReady = prepareCsv();
     }
-    if (sdReady && writeRow(ts, src, pm1, pm25, pm100)) {
+    if (sdReady && writeRow(ts, src, pm1, pm25, pm100, dhtTempC, dhtHumidity)) {
       lastWrittenPm25  = pm25;
       lastWrittenPm100 = pm100;
+      lastWrittenTemp  = dhtTempC;
+      lastWrittenHum   = dhtHumidity;
       if (firstRecord) {
         firstRecord = false;
         SLOG.print("[SD] First recorded entry: ");
@@ -891,21 +984,21 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
   --line-soft:#f1f2f4; --hover:#fafbfc;
   --accent:#2563eb; --accent-dark:#1d4ed8; --accent-soft:#eef4ff;
   --ok:#15803d; --warn:#b45309; --err:#b91c1c;
-  --pm1:#16a34a; --pm25:#ea580c; --pm10:#dc2626;
+  --pm1:#16a34a; --pm25:#ea580c; --pm10:#dc2626; --temp:#7c3aed; --hum:#0891b2;
   --r:14px; --sh:0 1px 2px rgba(16,24,40,.05),0 10px 28px rgba(16,24,40,.06);
 }
 body.theme-dark{
   --bg:#0f1319; --card:#171d26; --text:#e7ebf2; --muted:#94a3b8; --line:#252d3a;
   --line-soft:#1f2733; --hover:#1d2430;
   --accent:#4f8cff; --accent-dark:#3a74e6; --accent-soft:#1b2534;
-  --pm1:#22c55e; --pm25:#f97316; --pm10:#ef4444;
+  --pm1:#22c55e; --pm25:#f97316; --pm10:#ef4444; --temp:#a78bfa; --hum:#22d3ee;
   --sh:0 1px 2px rgba(0,0,0,.5),0 12px 30px rgba(0,0,0,.45);
 }
 body.theme-contrast{
   --bg:#000000; --card:#000000; --text:#ffffff; --muted:#ffd400; --line:#ffffff;
   --line-soft:#3a3a3a; --hover:#141414;
   --accent:#00e5ff; --accent-dark:#00b8cc; --accent-soft:#00323a;
-  --pm1:#00ff66; --pm25:#ffcc00; --pm10:#ff3b30;
+  --pm1:#00ff66; --pm25:#ffcc00; --pm10:#ff3b30; --temp:#c084fc; --hum:#22d3ee;
   --sh:none;
 }
 body.theme-contrast .card,body.theme-contrast .val{border-width:2px}
@@ -934,6 +1027,7 @@ a:hover{text-decoration:underline}
 .muted{color:var(--muted);font-size:12px}
 .stale{opacity:.45}
 canvas{width:100%;height:320px;display:block;border:1px solid var(--line);border-radius:12px;background:var(--card)}
+#chartEnv{height:220px}
 .vals{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-top:8px}
 .val{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px;border-top:3px solid var(--line)}
 .val .muted{font-size:11.5px;text-transform:uppercase;letter-spacing:.05em}
@@ -941,6 +1035,8 @@ canvas{width:100%;height:320px;display:block;border:1px solid var(--line);border
 #cvals .val:nth-child(1){border-top-color:var(--pm1)}
 #cvals .val:nth-child(2){border-top-color:var(--pm25)}
 #cvals .val:nth-child(3){border-top-color:var(--pm10)}
+#cvals .val:nth-child(4){border-top-color:var(--temp)}
+#cvals .val:nth-child(5){border-top-color:var(--hum)}
 table{border-collapse:separate;border-spacing:0;width:100%;font-size:13.5px}
 th{text-align:left;font-size:11.5px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600;padding:8px 10px;border-bottom:1px solid var(--line)}
 td{padding:9px 10px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
@@ -1000,16 +1096,21 @@ tbody tr:last-child td{border-bottom:none}
   </div>
   <div class="muted" id="rangeinfo" style="margin-bottom:6px">-</div>
   <canvas id="chart"></canvas>
-  <div class="muted" id="chartinfo">-</div>
+  <div class="muted" id="chartinfo" style="margin-bottom:10px">-</div>
+  <canvas id="chartEnv"></canvas>
+  <div class="muted" id="chartinfoEnv">-</div>
 </div>
 
 <div class="card">
   <div class="muted">Current values (updated every 5 s)</div>
   <div class="kv" id="cage" style="margin:6px 0">sensor: -</div>
+  <div class="kv" id="dhtstate" style="margin:0 0 6px">AM2302: -</div>
   <div class="vals" id="cvals">
     <div class="val"><div class="muted">PM1.0</div><div class="big" id="c1">-</div></div>
     <div class="val"><div class="muted">PM2.5</div><div class="big" id="c25">-</div></div>
     <div class="val"><div class="muted">PM10</div><div class="big" id="c10">-</div></div>
+    <div class="val"><div class="muted">Temperature &deg;C</div><div class="big" id="ctemp">-</div></div>
+    <div class="val"><div class="muted">Humidity %</div><div class="big" id="chum">-</div></div>
   </div>
   <div class="muted" id="cupd">-</div>
 </div>
@@ -1201,6 +1302,7 @@ function pollStatus(){
         ? (s.apSsid + "  " + s.apIp + "  channel " + s.apChannel + "  clients: " + s.apClients)
         : "disabled";
     renderSensorState(s);
+    renderDhtState(s);
     if (s.epoch > 1000000000) { boardEpoch = s.epoch; }
     currentFile = s.file;
     if (selFile === "") { selFile = s.file; q("file").textContent = selFile; }
@@ -1247,12 +1349,28 @@ function renderSensorState(s){
   }
 }
 
+function renderDhtState(s){
+  var el = q("dhtstate");
+  if (!s.dhtOk) {
+    el.textContent = "AM2302: no data yet (failed reads: " + s.dhtBad + ")";
+    el.style.color = "#b91c1c";
+    return;
+  }
+  var age = (typeof s.dhtAgeSec === "number") ? s.dhtAgeSec : -1;
+  var txt = "AM2302: " + s.current.temp + " \u00b0C / " + s.current.hum + " %";
+  if (age >= 0 && age < 15) { el.style.color = "#15803d"; txt += "  (read " + age + " s ago)"; }
+  else { el.style.color = "#b45309"; txt += "  (last read " + age + " s ago)"; }
+  el.textContent = txt;
+}
+
 function pollCurrent(){
   getJSON("/api/status").then(function(s){
     if (s.current) {
       q("c1").textContent  = s.current.pm1;
       q("c25").textContent = s.current.pm25;
       q("c10").textContent = s.current.pm100;
+      q("ctemp").textContent = (s.current.temp === null || s.current.temp === undefined) ? "-" : s.current.temp;
+      q("chum").textContent  = (s.current.hum  === null || s.current.hum  === undefined) ? "-" : s.current.hum;
     }
     q("cupd").textContent = "read at: " + s.time + " (every 5 s)";
   }).catch(function(){});
@@ -1363,14 +1481,14 @@ function renderFiles(){
 function palette(){
   if (currentTheme === "dark") {
     return {bg:"#171d26", grid:"#2a3342", axis:"#5b6a80", label:"#94a3b8", text:"#e7ebf2",
-            pm1:"#22c55e", pm25:"#f97316", pm10:"#ef4444"};
+            pm1:"#22c55e", pm25:"#f97316", pm10:"#ef4444", temp:"#a78bfa", hum:"#22d3ee"};
   }
   if (currentTheme === "contrast") {
     return {bg:"#000000", grid:"#3a3a3a", axis:"#ffffff", label:"#ffd400", text:"#ffffff",
-            pm1:"#00ff66", pm25:"#ffcc00", pm10:"#ff3b30"};
+            pm1:"#00ff66", pm25:"#ffcc00", pm10:"#ff3b30", temp:"#c084fc", hum:"#22d3ee"};
   }
   return {bg:"#ffffff", grid:"#e6e8eb", axis:"#aaa", label:"#666", text:"#333",
-          pm1:"#16a34a", pm25:"#ea580c", pm10:"#dc2626"};
+          pm1:"#16a34a", pm25:"#ea580c", pm10:"#dc2626", temp:"#7c3aed", hum:"#0891b2"};
 }
 
 /* Draw the chart into the given context */
@@ -1451,6 +1569,85 @@ function drawChart(g, L, T, pw, ph, data, fs, lw){
   });
 }
 
+/* Second chart: temperature and humidity (Y axis 0..100 covers % and degC) */
+function drawEnvChart(g, L, T, pw, ph, data, fs, lw){
+  g.font = fs + "px Arial";
+  var pal = palette();
+
+  var d = data.filter(function(r){ return r[4] !== null && r[4] !== undefined; });
+  if (!d.length) {
+    g.fillStyle = pal.label;
+    g.fillText("No temperature / humidity data in the selected range.", L, T + fs + 4);
+    return;
+  }
+
+  var xmin = data[0][0], xmax = data[data.length-1][0];
+  if (xmax <= xmin) xmax = xmin + 1;
+  var ymax = 100, i, v, t, x, y;
+
+  function X(tt){ return L + (tt - xmin) * pw / (xmax - xmin); }
+  function Y(vv){ return T + ph - vv * ph / ymax; }
+
+  g.strokeStyle = pal.grid;
+  g.fillStyle = pal.label;
+  g.lineWidth = 1;
+  for (i = 0; i <= 4; i++) {
+    v = ymax * i / 4; y = Y(v);
+    g.beginPath(); g.moveTo(L, y); g.lineTo(L + pw, y); g.stroke();
+    g.textAlign = "right"; g.fillText(v.toFixed(0), L - 6, y + fs*0.35);
+  }
+  for (i = 0; i <= 4; i++) {
+    t = xmin + (xmax - xmin) * i / 4; x = X(t);
+    g.beginPath(); g.moveTo(x, T); g.lineTo(x, T + ph); g.stroke();
+    g.textAlign = "center"; g.fillText(fmtAxis(Math.round(t), xmax - xmin), x, T + ph + fs + 4);
+  }
+  g.strokeStyle = pal.axis;
+  g.beginPath(); g.moveTo(L, T); g.lineTo(L, T + ph); g.lineTo(L + pw, T + ph); g.stroke();
+
+  g.save();
+  g.translate(fs * 0.95, T + ph / 2);
+  g.rotate(-Math.PI / 2);
+  g.textAlign = "center";
+  g.fillStyle = pal.label;
+  g.fillText("\u00b0C / %", 0, 0);
+  g.restore();
+
+  var series = [
+    {idx:4, col:pal.temp, name:"Temperature \u00b0C"},
+    {idx:5, col:pal.hum,  name:"Humidity %"}
+  ];
+
+  series.forEach(function(s){
+    g.strokeStyle = s.col;
+    g.lineWidth = lw;
+    g.beginPath();
+    var prvi = true;
+    d.forEach(function(r){
+      var vv = r[s.idx];
+      if (vv === null || vv === undefined) { prvi = true; return; }
+      var px = X(r[0]), py = Y(vv);
+      if (prvi) { g.moveTo(px, py); prvi = false; } else { g.lineTo(px, py); }
+    });
+    g.stroke();
+    g.fillStyle = s.col;
+    d.forEach(function(r){
+      var vv = r[s.idx];
+      if (vv === null || vv === undefined) return;
+      g.beginPath();
+      g.arc(X(r[0]), Y(vv), lw + 0.6, 0, 6.2832);
+      g.fill();
+    });
+  });
+
+  var lx = L;
+  series.forEach(function(s){
+    g.fillStyle = s.col; g.fillRect(lx, T - fs*1.4, fs*0.9, fs*0.9);
+    g.fillStyle = pal.text; g.textAlign = "left";
+    g.fillText(s.name, lx + fs*1.2, T - fs*0.5);
+    lx += fs * 11;
+  });
+}
+
 function draw(){
   var cv = q("chart");
   var w = cv.clientWidth || 640;
@@ -1470,11 +1667,23 @@ function draw(){
   q("rangeinfo").textContent = info;
 
   drawChart(g, 52, 26, w-52-10, h-26-28, d, 12, 2);
+
+  var cve = q("chartEnv");
+  var we = cve.clientWidth || 640;
+  var he = cve.clientHeight || 220;
+  cve.width = Math.round(we*dpr);
+  cve.height = Math.round(he*dpr);
+  var ge = cve.getContext("2d");
+  ge.setTransform(dpr,0,0,dpr,0,0);
+  ge.clearRect(0,0,we,he);
+  drawEnvChart(ge, 52, 26, we-52-10, he-26-28, d, 12, 2);
+  var withEnv = d.filter(function(r){ return r[4] !== null && r[4] !== undefined; }).length;
+  q("chartinfoEnv").textContent = "temperature / humidity: " + withEnv + " of " + d.length + " records";
 }
 
 function exportPNG(){
   var d = applyRange();
-  var w = 1200, h = 620;
+  var w = 1200, h = 880;
   var cv = document.createElement("canvas");
   cv.width = w; cv.height = h;
   var g = cv.getContext("2d");
@@ -1488,7 +1697,11 @@ function exportPNG(){
              "  |  time source: " + srcLabel +
              "  |  exported: " + new Date().toLocaleString(), 24, 58);
 
-  drawChart(g, 70, 100, w - 70 - 40, h - 100 - 60, d, 14, 2.4);
+  drawChart(g, 70, 100, w - 70 - 40, 320, d, 14, 2.4);
+
+  g.fillStyle = pal.text; g.font = "bold 16px Arial"; g.textAlign = "left";
+  g.fillText("Temperature / humidity", 24, 480);
+  drawEnvChart(g, 70, 505, w - 70 - 40, 320, d, 14, 2.4);
 
   var a = document.createElement("a");
   var ts = new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19);
@@ -1832,6 +2045,16 @@ static void handleRoot() {
   server.sendContent("");
 }
 
+// Serialises one record as a JSON array: [ts,pm1,pm25,pm100,temp,hum]
+static void rowJson(char *out, size_t n, const LogRow &r, bool first) {
+  char tbuf[16] = "null";
+  char hbuf[16] = "null";
+  if (!isnan(r.temp)) { snprintf(tbuf, sizeof(tbuf), "%.1f", r.temp); }
+  if (!isnan(r.hum))  { snprintf(hbuf, sizeof(hbuf), "%.1f", r.hum);  }
+  snprintf(out, n, "%s[%lu,%u,%u,%u,%s,%s]", (first ? "" : ","),
+           (unsigned long)r.ts, r.pm1, r.pm25, r.pm100, tbuf, hbuf);
+}
+
 static void handleStatus() {
   char now[32];
   char boot[24];
@@ -1852,6 +2075,10 @@ static void handleStatus() {
   j += ",\"ageSec\":";    j += String((uint32_t)((millis() - lastPmsMs) / 1000UL));
   j += ",\"framesOk\":";  j += String(framesOk);
   j += ",\"framesBad\":"; j += String(framesBad);
+  j += ",\"dhtOk\":";     j += (dhtEverOk ? "true" : "false");
+  j += ",\"dhtGood\":";   j += String(dhtGood);
+  j += ",\"dhtBad\":";    j += String(dhtBad);
+  j += ",\"dhtAgeSec\":"; j += (dhtEverOk ? String((uint32_t)((millis() - dhtLastGoodMs) / 1000UL)) : String(-1));
 
   // Wired network
   j += ",\"ethActive\":"; j += (ethActive ? "true" : "false");
@@ -1881,8 +2108,10 @@ static void handleStatus() {
     j += ",\"pm1\":";    j += String(lastPm1);
     j += ",\"pm25\":";   j += String(lastPm25);
     j += ",\"pm100\":";  j += String(lastPm100);
+    j += ",\"temp\":";   j += (isnan(dhtTempC)    ? String("null") : String(dhtTempC, 1));
+    j += ",\"hum\":";    j += (isnan(dhtHumidity) ? String("null") : String(dhtHumidity, 1));
   } else {
-    j += "\"ts\":0,\"pm1\":\"-\",\"pm25\":\"-\",\"pm100\":\"-\"";
+    j += "\"ts\":0,\"pm1\":\"-\",\"pm25\":\"-\",\"pm100\":\"-\",\"temp\":null,\"hum\":null";
   }
   j += "}}";
 
@@ -1922,9 +2151,7 @@ static void handleData() {
     char row[96];
     size_t pos = 0;
     for (int i = 0; i < histCount; i++) {
-      snprintf(row, sizeof(row), "%s[%lu,%u,%u,%u]",
-               (i == 0 ? "" : ","),
-               (unsigned long)histBuf[i].ts, histBuf[i].pm1, histBuf[i].pm25, histBuf[i].pm100);
+      rowJson(row, sizeof(row), histBuf[i], (i == 0));
       size_t lr = strlen(row);
       if (pos + lr > sizeof(buf) - 1) {
         buf[pos] = 0;
@@ -1971,10 +2198,9 @@ static void handleData() {
 
   for (int i = 0; i < ringCount; i++) {
     LogRow r = ring[(ringHead + i) % RING_MAX];
-    snprintf(buf, sizeof(buf), "%s[%lu,%u,%u,%u]",
-             (i == 0 ? "" : ","),
-             (unsigned long)r.ts, r.pm1, r.pm25, r.pm100);
-    server.sendContent(buf);
+    char row[96];
+    rowJson(row, sizeof(row), r, (i == 0));
+    server.sendContent(row);
   }
   server.sendContent("]}");
   server.sendContent("");
@@ -2256,6 +2482,21 @@ void loop() {
   if ((nowMs - lastRotCheck) >= 1000UL) {
     lastRotCheck = nowMs;
     checkRotation();
+  }
+
+  // AM2302 read (sensor supports ~0.5 Hz, so every 3 s is plenty)
+  if ((nowMs - lastDhtRead) >= DHT_READ_MS) {
+    lastDhtRead = nowMs;
+    float t = NAN, h = NAN;
+    if (readDht22(t, h)) {
+      dhtTempC      = t;
+      dhtHumidity   = h;
+      dhtLastGoodMs = nowMs;
+      dhtEverOk     = true;
+      dhtGood++;
+    } else {
+      dhtBad++;
+    }
   }
 
   // No delay(): handle a sample as soon as a full 32-byte frame is available.
