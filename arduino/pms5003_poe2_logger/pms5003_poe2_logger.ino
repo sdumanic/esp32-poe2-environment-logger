@@ -76,6 +76,7 @@
 #include <Update.h>
 #include <sys/time.h>
 #include <time.h>
+#include <algorithm>
 
 // ============================ CONFIGURATION ============================
 
@@ -110,7 +111,7 @@
 // ---- Web server and graph ----
 #define WEB_PORT                80
 #define RING_MAX                500     // records kept in RAM for a single file
-#define HIST_MAX                3000    // max records for a multi-file history query
+#define HIST_MAX                1200    // max records returned for a history query
 
 // ---- OTA (network update) ----
 #define OTA_ENABLE      1
@@ -388,6 +389,24 @@ static void ringPush(uint32_t ts, uint16_t a, uint16_t b, uint16_t c, float tf, 
 
 // Loads a CSV file into the ring (last RING_MAX records). If the ring already
 // holds that file, nothing is read again.
+// Parses one CSV data line into a LogRow; false for headers or bad lines
+static bool parseCsvLine(const char *line, LogRow &r) {
+  unsigned long ts = 0;
+  unsigned a = 0, b = 0, c = 0;
+  char source[16] = {0};
+  float tf = NAN, hf = NAN;
+  if (sscanf(line, "%lu,%15[^,],%u,%u,%u,%f,%f", &ts, source, &a, &b, &c, &tf, &hf) < 5) {
+    return false;
+  }
+  r.ts    = (uint32_t)ts;
+  r.pm1   = (uint16_t)a;
+  r.pm25  = (uint16_t)b;
+  r.pm100 = (uint16_t)c;
+  r.temp  = tf;
+  r.hum   = hf;
+  return true;
+}
+
 static bool loadIntoRing(const String &file) {
   if (ringValid && ringFile == file) {
     return true;
@@ -401,20 +420,35 @@ static bool loadIntoRing(const String &file) {
   }
 
   ringReset(file);
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() < 8) continue;
-    if (line[0] < '0' || line[0] > '9') continue;   // skip header
-
-    unsigned long ts = 0;
-    unsigned a = 0, b = 0, c = 0;
-    char source[16] = {0};
-    float tf = NAN, hf = NAN;
-    int parsed = sscanf(line.c_str(), "%lu,%15[^,],%u,%u,%u,%f,%f",
-                         &ts, source, &a, &b, &c, &tf, &hf);
-    if (parsed >= 5) {
-      ringPush((uint32_t)ts, (uint16_t)a, (uint16_t)b, (uint16_t)c, tf, hf);
+  char buf[512];
+  size_t pos = 0;
+  int rd;
+  while ((rd = f.read((uint8_t *)buf + pos, sizeof(buf) - pos - 1)) > 0) {
+    pos += (size_t)rd;
+    buf[pos] = 0;
+    char *line = buf;
+    char *nl;
+    while ((nl = strchr(line, char(10))) != nullptr) {
+      *nl = 0;
+      if (line[0] >= 48 && line[0] <= 57) {
+        LogRow r;
+        if (parseCsvLine(line, r)) {
+          ringPush(r.ts, r.pm1, r.pm25, r.pm100, r.temp, r.hum);
+        }
+      }
+      line = nl + 1;
+    }
+    size_t rest = pos - (size_t)(line - buf);
+    memmove(buf, line, rest);
+    pos = rest;
+  }
+  if (pos > 0) {
+    buf[pos] = 0;
+    if (buf[0] >= 48 && buf[0] <= 57) {
+      LogRow r;
+      if (parseCsvLine(buf, r)) {
+        ringPush(r.ts, r.pm1, r.pm25, r.pm100, r.temp, r.hum);
+      }
     }
   }
   f.close();
@@ -434,6 +468,9 @@ static int      histDecim  = 1;
 static int      histCnt2   = 0;
 static uint32_t histTotal  = 0;         // records in range (before decimation)
 static String   histFiles  = "";
+static uint32_t histCacheFrom = 0;
+static uint32_t histCacheTill = 0;
+static bool     histCacheValid = false;
 
 static bool histEnsure() {
   if (histBuf == nullptr) {
@@ -511,50 +548,85 @@ static int fileNameDateKey(const String &name) {
   return name.substring(s, s + 8).toInt();
 }
 
+// Epoch (local time zone) from a /pms_YYYYMMDD_HHMMSS.csv name; 0 if the name
+// has no timestamp (for example /pms_millis_0000123456.csv).
+static uint32_t fileNameEpoch(const String &name) {
+  int p = name.indexOf(CSV_PREFIX);
+  if (p < 0) return 0;
+  int s = p + (int)strlen(CSV_PREFIX);
+  if ((int)name.length() < s + 15) return 0;
+  const char *c = name.c_str() + s;
+  for (int i = 0; i < 8; i++) { if (c[i] < 48 || c[i] > 57) return 0; }
+  if (c[8] != 95) return 0;
+  for (int i = 9; i < 15; i++) { if (c[i] < 48 || c[i] > 57) return 0; }
+
+  struct tm t = {};
+  t.tm_year  = (c[0]-48)*1000 + (c[1]-48)*100 + (c[2]-48)*10 + (c[3]-48) - 1900;
+  t.tm_mon   = (c[4]-48)*10 + (c[5]-48) - 1;
+  t.tm_mday  = (c[6]-48)*10 + (c[7]-48);
+  t.tm_hour  = (c[9]-48)*10 + (c[10]-48);
+  t.tm_min   = (c[11]-48)*10 + (c[12]-48);
+  t.tm_sec   = (c[13]-48)*10 + (c[14]-48);
+  t.tm_isdst = -1;
+  time_t e = mktime(&t);
+  return (e > (time_t)NTP_EPOCH_MIN) ? (uint32_t)e : 0;
+}
+
 static bool loadHistoryRange(uint32_t from, uint32_t till) {
   if (sdFs == nullptr || !histEnsure()) {
     return false;
   }
   histReset();
 
-  int keyFrom = 0;
-  int keyTill = 0;
-  if (from >= NTP_EPOCH_MIN) {
-    keyFrom = dateKey(from > 172800UL ? (from - 172800UL) : 0);
-    uint32_t upper = (till == 0) ? (epochValid() ? (uint32_t)time(nullptr) : from) : till;
-    keyTill = dateKey(upper + 86400UL);
+  // A closed range never changes, so the previous result can be reused
+  if (histCacheValid && till != 0 && from == histCacheFrom && till == histCacheTill) {
+    return true;
   }
+  histCacheValid = false;
 
-  String candidates[64];
-  int    candidateCount = 0;
+  String names[64];
+  int    nameCount = 0;
 
   File root = sdFs->open("/");
   if (!root || !root.isDirectory()) {
     return false;
   }
   File f = root.openNextFile();
-  while (f && candidateCount < 64) {
+  while (f && nameCount < 64) {
     if (!f.isDirectory()) {
       String name = String(f.name());
       if (!name.startsWith("/")) {
         name = "/" + name;
       }
       if (name.indexOf(".csv") > 0 && name.indexOf(CSV_PREFIX) >= 0) {
-        bool include;
-        if (from >= NTP_EPOCH_MIN) {
-          int fk = fileNameDateKey(name);
-          include = (fk != 0) && (fk >= keyFrom) && (fk <= keyTill);
-        } else {
-          include = (fileNameDateKey(name) == 0);   // MILLIS files
-        }
-        if (include) {
-          candidates[candidateCount++] = name;
-        }
+        names[nameCount++] = name;
       }
     }
     f = root.openNextFile();
   }
   root.close();
+
+  // Timestamped names sort chronologically, so a file covers the span from its
+  // own creation until the next file starts. Only files whose span overlaps the
+  // requested range are actually read - this is what keeps queries fast.
+  std::sort(names, names + nameCount, [](const String &a, const String &b) { return a < b; });
+
+  String candidates[64];
+  int    candidateCount = 0;
+  for (int i = 0; i < nameCount && candidateCount < 64; i++) {
+    uint32_t start = fileNameEpoch(names[i]);
+    uint32_t end   = (i + 1 < nameCount) ? fileNameEpoch(names[i + 1]) : 0;
+
+    if (start == 0) {
+      if (from == 0) { candidates[candidateCount++] = names[i]; }   // MILLIS era file
+      continue;
+    }
+    if (from >= NTP_EPOCH_MIN) {
+      if (end != 0 && end <= from) continue;     // this file ended before the range
+      if (till != 0 && start > till) continue;   // this file starts after the range
+    }
+    candidates[candidateCount++] = names[i];
+  }
 
   for (int i = 0; i < candidateCount; i++) {
     uint32_t before = histTotal;
@@ -562,27 +634,38 @@ static bool loadHistoryRange(uint32_t from, uint32_t till) {
     if (!g) {
       continue;
     }
-    while (g.available()) {
-      String line = g.readStringUntil('\n');
-      line.trim();
-      if (line.length() < 8) continue;
-      if (line[0] < '0' || line[0] > '9') continue;
-
-      unsigned long ts = 0;
-      unsigned a = 0, b = 0, c = 0;
-      char source[16] = {0};
-      float tf = NAN, hf = NAN;
-      int parsed = sscanf(line.c_str(), "%lu,%15[^,],%u,%u,%u,%f,%f",
-                           &ts, source, &a, &b, &c, &tf, &hf);
-      if (parsed >= 5) {
-        if ((from == 0 || ts >= from) && (till == 0 || ts <= till)) {
+    char buf[512];
+    size_t pos = 0;
+    int rd;
+    bool stop = false;
+    while (!stop && (rd = g.read((uint8_t *)buf + pos, sizeof(buf) - pos - 1)) > 0) {
+      pos += (size_t)rd;
+      buf[pos] = 0;
+      char *line = buf;
+      char *nl;
+      while ((nl = strchr(line, char(10))) != nullptr) {
+        *nl = 0;
+        if (line[0] >= 48 && line[0] <= 57) {
           LogRow r;
-          r.ts    = (uint32_t)ts;
-          r.pm1   = (uint16_t)a;
-          r.pm25  = (uint16_t)b;
-          r.pm100 = (uint16_t)c;
-          r.temp  = tf;
-          r.hum   = hf;
+          if (parseCsvLine(line, r)) {
+            if (till != 0 && r.ts > till) { stop = true; break; }   // chronological file
+            if ((from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
+              histPush(r);
+            }
+          }
+        }
+        line = nl + 1;
+      }
+      if (stop) break;
+      size_t rest = pos - (size_t)(line - buf);
+      memmove(buf, line, rest);
+      pos = rest;
+    }
+    if (!stop && pos > 0) {
+      buf[pos] = 0;
+      if (buf[0] >= 48 && buf[0] <= 57) {
+        LogRow r;
+        if (parseCsvLine(buf, r) && (from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
           histPush(r);
         }
       }
@@ -599,6 +682,12 @@ static bool loadHistoryRange(uint32_t from, uint32_t till) {
 
   if (histCount > 1) {
     qsort(histBuf, histCount, sizeof(LogRow), cmpLogRow);
+  }
+
+  if (till != 0) {                 // remember the result of a closed range
+    histCacheFrom  = from;
+    histCacheTill  = till;
+    histCacheValid = true;
   }
   return true;
 }
@@ -1092,7 +1181,6 @@ tbody tr:last-child td{border-bottom:none}
     <label class="kv">From: <input type="datetime-local" id="from" step="1"></label>
     <label class="kv">To: <input type="datetime-local" id="till" step="1"></label>
     <button id="apply">Apply range</button>
-    <button id="clear">All</button>
     <button id="png">Download PNG</button>
   </div>
   <div class="muted" id="rangeinfo" style="margin-bottom:6px">-</div>
@@ -1283,26 +1371,12 @@ function rangeLabel(){
   if (mode === "range" && rangeFrom) {
     return fmtFull(rangeFrom) + "  -  " + (rangeTill ? fmtFull(rangeTill) : "now");
   }
-  if (fromEpoch || tillEpoch) {
-    return fmtFull(fromEpoch) + "  -  " + (tillEpoch ? fmtFull(tillEpoch) : "end");
-  }
-  var el = q("range");
-  return el.options[el.selectedIndex].text;
+  return "single file";
 }
 
 /* Filter: the custom from-to range first (epoch only), then the quick range */
 function applyRange(){
-  var d = rows.slice();
-  if (hasEpochTime() && (fromEpoch || tillEpoch)) {
-    return d.filter(function(r){
-      return (!fromEpoch || r[0] >= fromEpoch) && (!tillEpoch || r[0] <= tillEpoch);
-    });
-  }
-  if (!rangeSec) return d;
-  var unit = hasEpochTime() ? 1 : 1000;
-  var last = rows[rows.length-1][0];
-  var limit = last - rangeSec * unit;
-  return d.filter(function(r){ return r[0] >= limit; });
+  return rows.slice();   // the rows already are exactly the requested range
 }
 
 function pollStatus(){
@@ -1329,19 +1403,15 @@ function pollStatus(){
     currentFile = s.file;
     if (selFile === "") { selFile = s.file; q("file").textContent = selFile; }
 
-    if (!rangeInitialised && rangeSec > 0 && boardEpoch > 0) {
+    if (!rangeInitialised && boardEpoch > 0) {
       rangeInitialised = true;
-      mode = "range"; rangeFrom = boardEpoch - rangeSec; rangeTill = 0; rangeSec = 0;
-      loadRange();
+      fillRangeInputs(rangeSec > 0 ? rangeSec : 300);
+      applyCustomRange();
     }
 
     if (s.records !== lastCount) {
       lastCount = s.records;
-      if (mode === "range") {
-        if (rangeTill === 0 && boardEpoch > 0 && (Date.now()/1000 - lastRangeLoad) > 5) { loadRange(); }
-      } else if (selFile === s.file) {
-        loadData();
-      }
+      if (mode === "file" && selFile === s.file) { loadData(); }
     }
   }).catch(function(){});
 }
@@ -1401,7 +1471,7 @@ function pollCurrent(){
 }
 
 function loadRange(){
-  var qs = "/api/data?from=" + rangeFrom + "&to=" + (rangeTill || 0);
+  var qs = "/api/data?from=" + rangeFrom + "&to=" + rangeTill;
   getJSON(qs).then(function(d){
     rows = d.rows || [];
     srcLabel = d.source || "NTP";
@@ -1704,7 +1774,7 @@ function draw(){
   var d = applyRange();
   var info = "showing " + d.length + " of " + rows.length + " records";
   if (d.length > 1) { info += "  |  range: " + fmtFull(d[0][0]) + "  -  " + fmtFull(d[d.length-1][0]); }
-  if (mode !== "range") { info += "  |  selection: " + rangeLabel(); }
+  if (mode === "range") { info += "  |  requested: " + rangeLabel(); }
   q("rangeinfo").textContent = info;
 
   drawChart(g, 52, 26, w-52-10, h-26-28, d, 12, 2);
@@ -1767,40 +1837,42 @@ function exportPNG(){
   document.body.removeChild(a);
 }
 
+function pad2(v){ return (v < 10 ? "0" : "") + v; }
+
+function toLocalInput(d){
+  return d.getFullYear() + "-" + pad2(d.getMonth()+1) + "-" + pad2(d.getDate()) +
+         "T" + pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+}
+
+/* Fills From/To for a quick range (120 = 2 min, 300 = 5 min ...) */
+function fillRangeInputs(sec){
+  var now = new Date();
+  q("from").value = toLocalInput(new Date(now.getTime() - sec*1000));
+  q("till").value = toLocalInput(now);
+}
+
+/* Loads the chart for the From/To fields (quick ranges only fill them in) */
 function applyCustomRange(){
-  var from = q("from").value;
-  var till = q("till").value;
-  var fromEp = from ? Math.floor(new Date(from).getTime()/1000) : 0;
-  var tillEp = till ? Math.floor(new Date(till).getTime()/1000) : 0;
+  var fromV = q("from").value;
+  var tillV = q("till").value;
+  if (!fromV || !tillV) {
+    q("chartinfo").textContent = "Set both From and To (or pick a quick range).";
+    return;
+  }
+  var fromEp = Math.floor(new Date(fromV).getTime()/1000);
+  var tillEp = Math.floor(new Date(tillV).getTime()/1000);
+  if (!(fromEp > 1000000000) || !(tillEp > 1000000000)) {
+    q("chartinfo").textContent = "Invalid date/time.";
+    return;
+  }
+  if (tillEp <= fromEp) { tillEp = fromEp + 60; }
 
-  if (!fromEp && !tillEp) { clearRanges(); return; }
-
-  /* history query on the board across all files in the range */
   mode = "range";
   rangeFrom = fromEp;
   rangeTill = tillEp;
-  fromEpoch = 0;
-  tillEpoch = 0;
-  rangeSec = 0;
-  q("range").value = "0";
   loadRange();
 }
 
-function clearRanges(){
-  mode = "file";
-  fromEpoch = 0;
-  tillEpoch = 0;
-  rangeSec = 0;
-  rangeFrom = 0;
-  rangeTill = 0;
-  q("from").value = "";
-  q("till").value = "";
-  q("range").value = "0";
-  try { localStorage.setItem("pms_range", "0"); } catch(e) {}
-  if (currentFile) { selFile = currentFile; }
-  lastCount = -1;
-  loadData();
-}
 
 window.addEventListener("load", function(){
   /* Remember the selected range in the browser (localStorage) */
@@ -1816,27 +1888,11 @@ window.addEventListener("load", function(){
   } catch (e) {}
 
   q("range").onchange = function(){
-    rangeSec = parseInt(this.value, 10) || 0;
-    fromEpoch = 0; tillEpoch = 0;
-    q("from").value = ""; q("till").value = "";
+    var sec = parseInt(this.value, 10) || 0;
     try { localStorage.setItem("pms_range", this.value); } catch (e) {}
-
-    if (rangeSec > 0 && boardEpoch > 0) {
-      /* pull data from every file covering the selected range */
-      mode = "range";
-      rangeFrom = boardEpoch - rangeSec;
-      rangeTill = 0;
-      rangeSec = 0;
-      loadRange();
-    } else {
-      mode = "file";
-      if (currentFile) { selFile = currentFile; }
-      lastCount = -1;
-      loadData();
-    }
+    if (sec > 0) { fillRangeInputs(sec); }   // only fills the fields, press Apply to load
   };
   q("apply").onclick = applyCustomRange;
-  q("clear").onclick = clearRanges;
   q("png").onclick = exportPNG;
   q("prevpage").onclick = function(){ filePage--; renderFiles(); };
   q("nextpage").onclick = function(){ filePage++; renderFiles(); };
@@ -2186,6 +2242,7 @@ static void handleData() {
       uint32_t t = from; from = till; till = t;
     }
 
+    uint32_t t0 = millis();
     if (sdFs == nullptr || !loadHistoryRange(from, till)) {
       server.send(500, "application/json", "{\"error\":\"cannot read the card\"}");
       return;
@@ -2195,30 +2252,33 @@ static void handleData() {
     server.setContentLength(CONTENT_LENGTH_UNKNOWN);
     server.send(200, "application/json", "");
 
-    char buf[240];
+    char buf[400];   // header + the file list can get long
+    uint32_t queryMs = millis() - t0;
     snprintf(buf, sizeof(buf),
              "{\"mode\":\"range\",\"from\":%lu,\"to\":%lu,\"source\":\"%s\","
-             "\"count\":%d,\"total\":%lu,\"decim\":%d,\"files\":\"%s\",\"rows\":[",
+             "\"count\":%d,\"total\":%lu,\"decim\":%d,\"ms\":%lu,\"files\":\"%s\",\"rows\":[",
              (unsigned long)from, (unsigned long)till, timeSourceName(),
-             histCount, (unsigned long)histTotal, histDecim, histFiles.c_str());
+             histCount, (unsigned long)histTotal, histDecim, (unsigned long)queryMs, histFiles.c_str());
     server.sendContent(buf);
 
     char row[96];
+    char out[1100];
     size_t pos = 0;
     for (int i = 0; i < histCount; i++) {
       rowJson(row, sizeof(row), histBuf[i], (i == 0));
       size_t lr = strlen(row);
-      if (pos + lr > sizeof(buf) - 1) {
-        buf[pos] = 0;
-        server.sendContent(buf);
+      if (pos + lr > sizeof(out) - 1) {
+        out[pos] = 0;
+        server.sendContent(out);
+        delay(1);              // let the TCP stack drain between blocks
         pos = 0;
       }
-      memcpy(buf + pos, row, lr);
+      memcpy(out + pos, row, lr);
       pos += lr;
     }
     if (pos > 0) {
-      buf[pos] = 0;
-      server.sendContent(buf);
+      out[pos] = 0;
+      server.sendContent(out);
     }
     server.sendContent("]}");
     server.sendContent("");
@@ -2251,11 +2311,25 @@ static void handleData() {
            file.c_str(), timeSourceName(), ringCount);
   server.sendContent(buf);
 
+  char row[96];
+  char out[1100];
+  size_t pos = 0;
   for (int i = 0; i < ringCount; i++) {
     LogRow r = ring[(ringHead + i) % RING_MAX];
-    char row[96];
     rowJson(row, sizeof(row), r, (i == 0));
-    server.sendContent(row);
+    size_t lr = strlen(row);
+    if (pos + lr > sizeof(out) - 1) {
+      out[pos] = 0;
+      server.sendContent(out);
+      delay(1);
+      pos = 0;
+    }
+    memcpy(out + pos, row, lr);
+    pos += lr;
+  }
+  if (pos > 0) {
+    out[pos] = 0;
+    server.sendContent(out);
   }
   server.sendContent("]}");
   server.sendContent("");
