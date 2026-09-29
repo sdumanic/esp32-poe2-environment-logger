@@ -1,4 +1,4 @@
-﻿/*
+/*
   ESP32-POE2 + PMS5003 + microSD + NTP + web server + Wi-Fi AP
   ============================================================
 
@@ -1107,6 +1107,7 @@ button{font:inherit;font-size:13px;font-weight:600;padding:8px 14px;border:1px s
 button:hover{background:var(--hover);border-color:var(--accent)}
 button:active{transform:translateY(1px)}
 #apply{background:var(--accent);border-color:var(--accent);color:#fff}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
 #apply:hover{background:var(--accent-dark);border-color:var(--accent-dark)}
 a{color:var(--accent);text-decoration:none;font-weight:500}
 a:hover{text-decoration:underline}
@@ -1181,6 +1182,8 @@ tbody tr:last-child td{border-bottom:none}
     <label class="kv">From: <input type="datetime-local" id="from" step="1"></label>
     <label class="kv">To: <input type="datetime-local" id="till" step="1"></label>
     <button id="apply">Apply range</button>
+    <button id="live">Live</button>
+    <button id="csv">Download CSV</button>
     <button id="png">Download PNG</button>
   </div>
   <div class="muted" id="rangeinfo" style="margin-bottom:6px">-</div>
@@ -1484,6 +1487,7 @@ function loadRange(){
     info += "  |  time source: " + srcLabel;
     q("chartinfo").textContent = info;
     q("file").textContent = "history";
+    q("live").className = "";
     draw();
   }).catch(function(){});
 }
@@ -1492,6 +1496,7 @@ function loadData(){
   getJSON("/api/data?f=" + encodeURIComponent(selFile)).then(function(d){
     rows = d.rows || [];
     srcLabel = d.source || "NTP";
+    q("live").className = "on";
     q("chartinfo").textContent = d.file + "  |  total records: " + rows.length +
                                  "  |  time source: " + srcLabel;
     draw();
@@ -1837,6 +1842,34 @@ function exportPNG(){
   document.body.removeChild(a);
 }
 
+/* Live view: chart of the active file, refreshed on every new record */
+function goLive(){
+  mode = "file";
+  if (currentFile) { selFile = currentFile; }
+  rangeFrom = 0;
+  rangeTill = 0;
+  lastCount = -1;
+  q("file").textContent = selFile;
+  loadData();
+}
+
+/* Downloads the records of the From/To range as CSV (the chart is untouched) */
+function downloadCsv(){
+  var fromV = q("from").value;
+  var tillV = q("till").value;
+  if (!fromV || !tillV) { q("chartinfo").textContent = "Set both From and To before downloading."; return; }
+  var fromEp = Math.floor(new Date(fromV).getTime()/1000);
+  var tillEp = Math.floor(new Date(tillV).getTime()/1000);
+  if (!(fromEp > 1000000000) || !(tillEp > 1000000000)) { q("chartinfo").textContent = "Invalid date/time."; return; }
+  if (tillEp <= fromEp) { tillEp = fromEp + 60; }
+  var a = document.createElement("a");
+  a.href = "/export?from=" + fromEp + "&to=" + tillEp;
+  a.download = "";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+}
+
 function pad2(v){ return (v < 10 ? "0" : "") + v; }
 
 function toLocalInput(d){
@@ -1893,6 +1926,8 @@ window.addEventListener("load", function(){
     if (sec > 0) { fillRangeInputs(sec); }   // only fills the fields, press Apply to load
   };
   q("apply").onclick = applyCustomRange;
+  q("live").onclick = goLive;
+  q("csv").onclick = downloadCsv;
   q("png").onclick = exportPNG;
   q("prevpage").onclick = function(){ filePage--; renderFiles(); };
   q("nextpage").onclick = function(){ filePage++; renderFiles(); };
@@ -2428,6 +2463,67 @@ static void handleDelete() {
   server.send(303, "text/plain", "File deleted.");
 }
 
+// Compact local timestamp for file names: YYYYMMDD_HHMMSS
+static void nameStamp(uint32_t e, char *out, size_t n) {
+  if (e < NTP_EPOCH_MIN) { snprintf(out, n, "%lu", (unsigned long)e); return; }
+  struct tm t;
+  time_t tt = (time_t)e;
+  localtime_r(&tt, &t);
+  snprintf(out, n, "%04d%02d%02d_%02d%02d%02d",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+}
+
+// Downloads every record of the requested range as a CSV file.
+static void handleExport() {
+  String fromArg = server.arg("from");
+  String tillArg = server.arg("to");
+  uint32_t from = fromArg.length() ? (uint32_t)strtoul(fromArg.c_str(), nullptr, 10) : 0;
+  uint32_t till = tillArg.length() ? (uint32_t)strtoul(tillArg.c_str(), nullptr, 10) : 0;
+  if (from > 0 && till > 0 && till < from) { uint32_t t = from; from = till; till = t; }
+
+  if (sdFs == nullptr || !loadHistoryRange(from, till)) {
+    server.send(500, "text/plain", "Cannot read the card.");
+    return;
+  }
+
+  char s1[24], s2[24];
+  nameStamp(from, s1, sizeof(s1));
+  nameStamp(till, s2, sizeof(s2));
+  String fname = "pms_" + String(s1) + "_to_" + String(s2) + ".csv";
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent("timestamp,time_source,pm1_0,pm2_5,pm10,temp_c,humidity\r\n");
+
+  char row[128];
+  char out[1100];
+  size_t pos = 0;
+  for (int i = 0; i < histCount; i++) {
+    LogRow r = histBuf[i];
+    const char *src = (r.ts < NTP_EPOCH_MIN) ? "MILLIS" : timeSourceName();
+    char tb[16] = "";
+    char hb[16] = "";
+    if (!isnan(r.temp)) { snprintf(tb, sizeof(tb), "%.1f", r.temp); }
+    if (!isnan(r.hum))  { snprintf(hb, sizeof(hb), "%.1f", r.hum);  }
+    snprintf(row, sizeof(row), "%lu,%s,%u,%u,%u,%s,%s\r\n",
+             (unsigned long)r.ts, src, r.pm1, r.pm25, r.pm100, tb, hb);
+    size_t lr = strlen(row);
+    if (pos + lr > sizeof(out) - 1) {
+      out[pos] = 0;
+      server.sendContent(out);
+      delay(1);
+      pos = 0;
+    }
+    memcpy(out + pos, row, lr);
+    pos += lr;
+  }
+  if (pos > 0) {
+    out[pos] = 0;
+    server.sendContent(out);
+  }
+  server.sendContent("");
+}
+
 static void handleFavicon() {
   server.send(204, "text/plain", "");
 }
@@ -2476,6 +2572,7 @@ static void startWebServer() {
   server.on("/api/data", handleData);
   server.on("/api/files", handleFiles);
   server.on("/download", handleDownload);
+  server.on("/export", handleExport);
   server.on("/delete", handleDelete);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/favicon.ico", handleFavicon);

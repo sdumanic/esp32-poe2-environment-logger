@@ -7,8 +7,9 @@ a web page with a chart, a Wi-Fi access point and device administration.
 ![Web interface](docs/screenshot.png)
 
 *Web interface: network status and boot time in the header, chart with range
-filters (last 5 min by default, plus a custom from-to range), current values with
-the sensor freshness indicator, and the file list with download/delete actions.*
+filters (last 5 min by default, plus a custom from-to range), a live view of the
+active file, CSV download of the selected range, current values with the sensor
+freshness indicator, and the file list with download/delete actions.*
 
 ## Hardware
 
@@ -44,9 +45,14 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
 - Ethernet (DHCP or static IP) plus a **Wi-Fi access point** (SSID, password,
   channel); web UI and OTA work on both networks.
 - Web page: chart with range filters (last 5 min / 30 min / 1 h / 6 h / 24 h and
-  a custom from-to range), PNG export, current values, sensor freshness
-  indicator, file list with download and delete, a help modal with reference PM
-  values, and a header showing wired/wireless network settings and boot time.
+  a custom from-to range), a **Live** view of the active file (refreshes on every
+  new record), a **Download CSV** button for the selected range, PNG export,
+  current values, sensor freshness indicator, file list with download and delete,
+  a help modal with reference PM values, and a header showing wired/wireless
+  network settings and boot time.
+- Quick ranges only fill the From/To fields; the chart is (re)drawn on **Apply
+  range** and, in Live view, on every new record. Browsing history therefore never
+  slows down logging, and a CSV download never touches the chart.
 - History queries read **all files covering the selected range**, merge and sort
   them, and decimate evenly when there are more than 3000 records.
 - The file list shows the newest 15 files per page with page navigation.
@@ -87,6 +93,7 @@ MANUAL), otherwise `millis()`.
 | `/api/files` | JSON list of files on the card |
 | `/download?f=` | download a file |
 | `/delete?f=` | delete a file (the active one is protected) |
+| `/export?from=&to=` | CSV download of the records in a range (chart untouched) |
 | `/update` | firmware upload (POST, multipart) |
 
 ## Build and upload
