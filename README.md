@@ -1,8 +1,9 @@
-# ESP32-POE2 — PMS5003 logger with web UI and administration
+# ESP32-POE2 — PMS5003 + AM2302 environment logger with web UI and administration
 
-Particulate matter measurement (PM1.0 / PM2.5 / PM10) with a **PMS5003** sensor
-on an **Olimex ESP32-POE2**: logging to the onboard microSD card, NTP time,
-a web page with a chart, a Wi-Fi access point and device administration.
+Particulate matter (PM1.0 / PM2.5 / PM10) with a **PMS5003** sensor and
+temperature and humidity with an **AM2302 (DHT22)** sensor on an **Olimex
+ESP32-POE2**: logging to the onboard microSD card, NTP time, a web page with
+charts, a Wi-Fi access point and device administration.
 
 ![Web interface](docs/screenshot.png)
 
