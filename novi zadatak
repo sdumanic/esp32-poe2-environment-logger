@@ -1,0 +1,10 @@
+- napravit ćemo novu verziju ovog sustava
+- planirano korištenje je u komunikacijskim ormarima u podatkovnim centrima. U svaki bi se ormar stavila po jedna pločica koja mjeri dosadašnje parametre, a zapisivanje i prikaz bi se vodili na posebnom Linux serveru
+- osim mjerenja na pločicu ćemo spojiti čitać kartica putem wigand protokola, jedan kontakt na nadzor zatvorenosti vrata, i jedan izlaz za zatvaranje vrata. To će služiti za kontrolu pristupa.
+- izdvojit ćemo je u poseban projekt koji će biti privatan na githubu
+- sad ćemo imati server sa bazom podataka u koju će se zapisivati podaci
+- na samoj pločici će ostati samo web sučelje za administraciju pločice
+- ukoliko dođe do prekida komunikacije u pločici trebaju biti zapisani svi podaci o karticama, kako bi kontrola pristupa radila i offline. Također se podaci koji se monitoriraju, tad trebaju lokalno spremat dok se ponovno ne ostvari komunikacija sa serverom te se oni prebace u glavnu bazu. Pri tom treba provjerit dali je došlo i do nekih promjena na serveru koje treba učitati u pločicu.
+- web sučelje će sad bit na serveru na kojem će bit web server, baza podataka i sve potrebno za pregled
+- server će moći prikazivati podatke sa velikog broja ovakvih pločica
+- u sučelje će se logirati korisnici sa korisničkim imenom i lozinkom. Postojat će različiti nivoi pristupa

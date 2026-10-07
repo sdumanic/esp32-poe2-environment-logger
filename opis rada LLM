@@ -1,0 +1,133 @@
+Kako bi dodao da se određeni range pošalje u LLM i zatraži da provjeri dali je bilo nekih anomalija u količini čestica, temperaturi i vlazi
+
+Prije nego predložim izvedbu, provjerit ću što točno sketch već ima (endpointi, NVS postavke, JSON pomoćne funkcije, bufferi) da prijedlog bude konkretan.
+• Ran Select-String -Path arduino\pms5003_poe2_logger\pms5003_poe2_logger.ino -Pattern '^#include|^#define (HIST_MAX|RI…
+  └ 109: #define PMS_SILENCE_WARN_MS     5000UL
+    113: #define RING_MAX                500     // records kept in RAM for a single file
+    114: #define HIST_MAX                1200    // max records returned for a history query
+• Ran Select-String -Path arduino\pms5003_poe2_logger\pms5003_poe2_logger.ino -Pattern 'struct Settings|Preferences|pre…
+  └ 2572:   server.on("/api/data", handleData);
+    2573:   server.on("/api/files", handleFiles);
+    2574:   server.on("/download", handleDownload);
+Kratki odgovor: ne bih slao sirove podatke s ploče direktno LLM-u. Napravio bih to u dva sloja — deterministička statistika na ploči (pronalazi kandidate za anomaliju) i LLM samo za tumačenje (napiše što se dogodilo i zašto je sumnjivo). Ploča je preslaba i presiromašna memorijom da dva puta šalje ~40 KB preko TLS-a, a i model je puno točniji ako dobije sažetak nego 1200 sirovih redaka.
+
+Tri načina da to izvedeš
+
+ Opcija                 Kako radi                       Prednosti                       Nedostaci
+━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ A) Ploča zove LLM      POST /analyze?from=&to=,        Samostalno, radi iz bilo        API ključ je na SD/NVS-u, TLS
+                        firmware sam gradi JSON i       kojeg browsera, nema PC-a u     handshake traži ~40–50 KB
+                        zove api.openai.com preko       lancu                           slobodnog internog heapa,
+                        WiFiClientSecure                                                treba root CA
+─────────────────────  ──────────────────────────────  ──────────────────────────────  ───────────────────────────────
+ B) Browser zove LLM    Stranica pošalje /export        Nema izmjene firmvera osim      Ključ je u browseru
+                        podatke direktno LLM API-ju     UI-a                            (localStorage) → svatko na
+                        iz JS-a                                                         LAN-u ga može ukrasti
+─────────────────────  ──────────────────────────────  ──────────────────────────────  ───────────────────────────────
+ C) PC/proxy skripta    Skripta povuče /export?         Najlakše iterirati, najbolja    Traži da PC bude uključen;
+                        from=&to=, izračuna             analiza, ključ ostaje na PC-    nije "u kutiji"
+                        statistiku i zove LLM           u
+
+Preporuka: za tvoj use-case (kutija na PoE-u, povremena analiza) A, ali tako da ploča šalje sažetak + decimirani niz, a ne sve retke. Ako želiš prvo isprobati kvalitetu prompta bez diranja firmvera — C ti to da u pola sata.
+
+Što poslati
+
+Payload koji ploča sastavi (red veličine 6–10 KB, ~2,5–3 k tokena):
+
+{
+  "window": {"from": 1790716004, "to": 1790716223, "tz": "Europe/Zagreb",
+             "duration_min": 37, "samples": 61, "gap_max_s": 22},
+  "sensor": {"pm": "PMS5003 (1 ug/m3 resolution, 1 Hz)",
+             "env": "AM2302/DHT22 (+-0.5 C, +-2 %RH)"},
+  "stats": {
+    "pm25": {"min": 6, "avg": 8.4, "max": 11, "p95": 10, "mad": 1.2},
+    "pm10": {"min": 6, "avg": 8.6, "max": 11, "p95": 10, "mad": 1.2},
+    "temp_c": {"min": 27.6, "avg": 27.6, "max": 27.7},
+    "hum_pct": {"min": 19.4, "avg": 19.9, "max": 20.1},
+    "ratio_pm25_pm10": 0.97,
+    "missing_env": 0, "zero_pm": 0
+  },
+  "flags": [
+    {"type": "gap", "at": 1790716207, "detail": "no record for 18 s"},
+    {"type": "dht_missing", "at": 1790716210}
+  ],
+  "series": [[1790716004,6,10,10,27.6,19.8], [1790716012,7,11,11,27.6,19.8], ...],
+  "thresholds": {"pm25_who_24h": 15, "pm25_interim_24h": 35, "pm10_who_24h": 45,
+                 "rh_mould": 70, "dewpoint_condensation_delta_c": 2}
+}
+
+Ključno: series decimiraj na max ~240 točaka (za 24 h to je 6-minutna rezolucija — dovoljno za oblik krivulje), a flags popuni na ploči. Tako model ne mora "tražiti" anomaliju u tisućama brojeva, nego je objašnjava.
+
+Lokalne provjere (ovo je prava vrijednost, radi i bez LLM-a)
+
+Rupe: razmak između zapisa > 3× uobičajenog (izgubljeni frameovi, restart, SD greška).
+
+Senzor mrtav: framesBad raste, DHT nan, ili hum == 100 % / temp == -40 °C (DHT22 tipični simptomi).
+
+Zaglavljena vrijednost: ista PM2.5 vrijednost ≥ 20 uzastopnih zapisa (PMS5003 ponekad "zamrzne" bez greške checksuma).
+
+Spike: robustni z-score po MAD-u — |x − medijan| / (1.4826·MAD) > 4. Otporniji na pojedinačne skokove od obične devijacije.
+
+Step change: medijan prije/poslije prozora se razlikuje > 3× MAD (npr. počelo se pušiti u 14:30).
+
+Omjer PM2.5/PM10: > 0.9 → dim / izgaranje; < 0.3–0.4 → krupna prašina (građevina, vjetar). Odličan kontekst za LLM.
+
+Vlaga/kondenzacija: RH > 70 % (rizik plijesni), ili temp − rosište < 2 °C (kondenzacija na senzoru → lažni visoki PM).
+
+Pragovi: WHO 24 h PM2.5 15 (interim 35/75), PM10 45 µg/m³; uz 15-min i 1-h prosjek jer je 24 h besmislen za kratki raspon.
+
+Zero PM: vrijednost 0 uz normalnu vlagu → sumnjivo na PMS5003 (on legalno daje 0 samo u čistom zraku; često znači začepljen/ventilator).
+
+Prompt (ENG, jer ide u repo)
+
+You are an air-quality data analyst. You receive a JSON summary of one
+measurement window from an ESP32 logger (PMS5003 particulate sensor +
+AM2302 temperature/humidity sensor).
+
+Rules:
+- Use ONLY the numbers in the payload. Never invent data points.
+- Respect sensor limits (PMS5003 resolution 1 ug/m3; DHT22 +-0.5 C, +-2 %RH).
+- Treat the "flags" array as already-confirmed candidates, not as the whole story;
+  you may also find anomalies the flags missed.
+- Distinguish sensor faults (gaps, stuck values, missing env data) from real
+  environmental changes.
+- Keep the summary under 120 words.
+
+Return strict JSON:
+{"verdict":"normal|watch|anomalous",
+ "summary":"...",
+ "anomalies":[{"from":<epoch>,"to":<epoch>,"metric":"pm2_5|pm10|temp_c|humidity|data",
+               "kind":"spike|level|step|gap|stuck|sensor_fault",
+               "severity":"low|medium|high","evidence":"numbers",
+               "interpretation":"one sentence"}],
+ "actions":["..."]}
+
+Što treba u firmwareu za opciju A
+
+#include <HTTPClient.h> + <WiFiClientSecure.h> — sketch ih zasad ne uvozi, sve ostalo (Preferences, WebServer, jobs) već postoji.
+
+Tri nove NVS postavke u Settings: llmKey, llmModel, llmUrl (+ polje u /admin, maskirano u GET ispisu). Uzorak je već tu — prefs.getString("ntp", ...) u arduino/pms5003_poe2_logger/pms5003_poe2_logger.ino:336.
+
+Nova ruta server.on("/analyze", HTTP_POST, handleAnalyze) uz postojeće u arduino/pms5003_poe2_logger/pms5003_poe2_logger.ino:2573.
+
+handleAnalyze radi: loadHistoryRange(from, till) (već postoji i čita preko više datoteka) → izračun statistike → decimacija na 240 → ručno sastavljanje JSON-a (kao rowJson) → HTTPS POST → izvuci choices[0].message.content.
+
+Prije poziva provjeri ESP.getFreeHeap() > 60000 i da je NTP vrijeme postavljeno (inače cert ne prolazi validaciju). Timeout 20 s; ako pukne, vrati grešku i ne blokiraj logiranje — poziv ide iz web handlera, a loop() dalje piše na SD.
+
+Root CA za api.openai.com (ili setInsecure() ako ti je bitnija jednostavnost — kompromis je MITM na LAN-u).
+
+Rate limit: jedan /analyze najviše svakih 30 s + cache zadnjeg rezultata u RAM-u, da ne trošiš tokene slučajnim klikovima.
+
+UI: gumb Analyze range pored Download CSV — pošalje From/To, prikaže JSON u modalu, bez diranja grafa.
+
+Realni limiti o kojima treba znati
+
+AP (192.168.4.1) nema pristup internetu — analiza radi samo dok je Ethernet aktivan.
+
+Podaci izlaze s LAN-a; ako je to problem, opcija C (lokalni model preko Ollame) rješava.
+
+Trošak: ~3 k ulaznih + ~500 izlaznih tokena po analizi = red veličine 0,001–0,005 USD s malim modelom. Nema smisla zvati veliki model.
+
+Ako ti treba samo "je li bilo nečega čudnog", pragovi + flags to rješavaju bez ikakvog LLM-a i bez troška — LLM dodaje samo tekstualno objašnjenje.
+
+Ako želiš, mogu to implementirati — reci koju varijantu: A (sve na ploči, ključ u adminu), B (ključ u browseru) ili C (skripta koja povuče /export i pošalje LLM-u). Uz to mi reci koji model/API koristiš, jer o tome ovise root CA i format tijela zahtjeva.
