@@ -151,6 +151,9 @@ say so.
 
 ### P5 - Reset diagnostics
 
+**Status: implemented** (`resetReason` in `/api/status`, shown in the page header next to the
+boot time).
+
 Nobody can tell today whether the board rebooted because of a power cut, a panic or the
 watchdog.
 

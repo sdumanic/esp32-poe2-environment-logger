@@ -99,6 +99,7 @@
 #include <Update.h>
 #include <sys/time.h>
 #include <time.h>
+#include <esp_system.h>          // esp_reset_reason(): why the board (re)started
 #include <algorithm>
 
 // ============================ CONFIGURATION ============================
@@ -241,6 +242,7 @@ static bool        manualTime   = false;      // time set on /admin
 static const char *netMode      = "offline";
 
 static uint32_t    bootEpoch       = 0;       // 0 = unknown
+static esp_reset_reason_t bootResetReason = ESP_RST_UNKNOWN;
 static uint32_t    restartScheduled = 0;      // 0 = not scheduled
 
 static uint16_t    lastWrittenPm25  = 0xFFFF; // last WRITTEN value (for compare)
@@ -581,6 +583,9 @@ static bool parseCsvLine(const char *line, LogRow &r) {
 // when at least one record was handed to the sink.
 static bool scanCsvRange(const char *name, uint32_t from, uint32_t till,
                          RowSink sink, void *ctx) {
+  if (sdFs == nullptr) {                 // the card went away mid-session
+    return false;
+  }
   File f = sdFs->open(name, FILE_READ);
   if (!f || f.isDirectory()) {
     if (f) {
@@ -960,6 +965,11 @@ static void buildFileName() {
 }
 
 static bool prepareCsv() {
+  if (sdFs == nullptr) {
+    // No card is mounted: missing, dead, or being retried by pollSd(). Without
+    // this guard the next record would dereference a null FS and panic.
+    return false;
+  }
   if (csvPath[0] == '\0') {
     buildFileName();
   }
@@ -1585,7 +1595,7 @@ static void handleSample() {
                  (!isnan(dhtHumidity) && dhtHumidity != lastWrittenHum);
 
   if (changed) {
-    if (!sdReady) {
+    if (!sdReady && sdFs != nullptr) {
       sdReady = prepareCsv();
     }
     if (sdReady && writeRow(ts, src, pm1, pm25, pm100, dhtTempC, dhtHumidity)) {
@@ -1600,6 +1610,12 @@ static void handleSample() {
         SLOG.print(" ");
         SLOG.println(ts);
       }
+    } else if (!sdReady) {
+      // Not even attempted: no card is mounted. Count the lost record so the
+      // banner and /api/status show it; pollSd() keeps retrying in the
+      // background and reopens the file when the card answers again.
+      sdWriteFails++;
+      sdLastFailMs = millis();
     }
   }
 }
@@ -1705,7 +1721,7 @@ tbody tr:last-child td{border-bottom:none}
   </h1>
   <div class="row">
     <div class="kv">Board time: <b id="clock">-</b> <span class="tag" id="tsrc">-</span></div>
-    <div class="kv">Started: <b id="boot">-</b></div>
+    <div class="kv">Started: <b id="boot">-</b> <span class="muted" id="reset"></span></div>
     <div class="kv">File: <b id="file">-</b></div>
     <div class="kv">Records: <b id="recs">0</b></div>
     <div class="kv">OTA: <b id="ota">-</b></div>
@@ -1948,6 +1964,7 @@ function pollStatus(){
     q("recs").textContent  = s.records;
     q("ota").textContent   = s.ota ? s.ota : "-";
     q("boot").textContent  = s.boot;
+    q("reset").textContent = s.resetReason ? "(" + s.resetReason + ")" : "";
     if (s.theme && s.theme !== currentTheme) {
       currentTheme = s.theme;
       document.body.className = "theme-" + currentTheme;
@@ -2888,6 +2905,25 @@ static const char *jsonBool(bool v) {
   return v ? "true" : "false";
 }
 
+// Why the board started. "PANIC" or a watchdog means the firmware crashed,
+// "software/OTA restart" is a normal restart, "power-on"/"brownout" is the
+// mains - the serial console is off, so this is how a field reset is diagnosed.
+static const char *resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "power-on";
+    case ESP_RST_EXT:       return "external pin";
+    case ESP_RST_SW:        return "software/OTA restart";
+    case ESP_RST_PANIC:     return "PANIC (crash)";
+    case ESP_RST_INT_WDT:   return "interrupt watchdog";
+    case ESP_RST_TASK_WDT:  return "task watchdog";
+    case ESP_RST_WDT:       return "watchdog";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    case ESP_RST_BROWNOUT:  return "brownout";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "unknown";
+  }
+}
+
 static void handleStatus() {
   char now[32];
   char boot[24];
@@ -2930,7 +2966,7 @@ static void handleStatus() {
       "\"framesOk\":%lu,\"framesBad\":%lu,\"dhtOk\":%s,\"dhtGood\":%lu,"
       "\"dhtBad\":%lu,\"dhtAgeSec\":%ld,\"filesVer\":%lu,\"heap\":%lu,"
       "\"sdOk\":%s,\"sdFreeMb\":%lu,\"sdUsedPct\":%u,\"lastWriteAgeSec\":%ld,"
-      "\"writeFails\":%lu,"
+      "\"writeFails\":%lu,\"resetReason\":\"%s\","
       "\"ethActive\":%s,\"ethDhcp\":%s,\"ethIp\":\"%s\",\"ethMask\":\"%s\","
       "\"ethGw\":\"%s\",\"ethMac\":\"%s\","
       "\"apEnabled\":%s,\"apSsid\":\"%s\",\"apIp\":\"%s\",\"apChannel\":%u,"
@@ -2945,7 +2981,7 @@ static void handleStatus() {
       (long)(dhtEverOk ? (long)((millis() - dhtLastGoodMs) / 1000UL) : -1L),
       (unsigned long)filesVersion, (unsigned long)ESP.getFreeHeap(),
       jsonBool(sdOkNow), sdFreeMb, sdUsedPct, lastWriteAge,
-      (unsigned long)sdWriteFails,
+      (unsigned long)sdWriteFails, resetReasonName(bootResetReason),
       jsonBool(ethActive), jsonBool(settings.ethDhcp), ipS.c_str(),
       maskS.c_str(), gwS.c_str(), macS.c_str(),
       jsonBool(settings.apEnabled), settings.apSsid, apIpS.c_str(),
@@ -3341,6 +3377,7 @@ static void startWebServer() {
 // ============================== SETUP ==============================
 
 void setup() {
+  bootResetReason = esp_reset_reason();     // read once, reported by /api/status
 #if SERIAL_DEBUG
   Serial.begin(115200);
   delay(500);
