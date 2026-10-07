@@ -88,6 +88,31 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
   numbers come from the card on a 30 s timer, never inside a request. While
   writes keep failing the card is remounted every 30 s, so a card that was
   pulled out and pushed back in starts working again without a restart.
+- Rows are written only when something really moved: PM2.5/PM10 changes are
+  written immediately, temperature and humidity only when they change by at least
+  the configured step (defaults 0.2 degC / 0.5 %, editable on `/admin`) - the
+  AM2302 dithers by 0.1 degC, which used to produce a row every three seconds.
+  A heartbeat row is still written at least every 5 minutes while values differ.
+- "One file per day" (optional, `/admin`): all restarts of a day continue in
+  `/pms_YYYYMMDD_000000.csv` instead of opening a new file at every boot.
+- Trade-off of "one file per day": the log is not indexed, so a range query for
+  the end of the day has to read the whole (growing) day file - a few seconds for
+  a multi-megabyte file. With the option off, each file holds one run and the
+  queried ranges are tiny.
+- File retention (optional, `/admin`): files older than N days are removed at
+  boot, or on demand with **Delete older files now**. The active file is never
+  touched and 0 keeps everything.
+- The file table shows the span each file covers (start - end, derived from the
+  file names, so opening the files is not needed).
+- State-changing requests (`/delete`, `/admin` POST) are refused when the
+  `Origin`/`Referer` header points at another host, which blocks cross-site
+  requests that would otherwise reuse the browser's cached credentials. Requests
+  without those headers (curl, scripts) keep working.
+- A yellow banner appears while a documented factory password is still in use,
+  and `/admin` can generate a random AP password in the browser (`Generate`).
+- `/` is served with an ETag, so a browser that already has the page gets a
+  small `304 Not Modified` instead of the whole ~42 KB page. Polling stops while
+  the tab is hidden and refreshes as soon as it is visible again.
 - The header shows why the board started (`resetReason` in `/api/status`):
   power-on, software/OTA restart, panic, task or interrupt watchdog, brownout.
   That makes an unexpected reset in the field diagnosable without a serial
@@ -105,6 +130,8 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
   so a refresh transfers a few hundred bytes instead of the whole 500-record
   buffer; the board reports `oldest` and the page falls back to a full reload
   when the buffer has rotated past what it already had.
+- The Live caption says how much the RAM buffer covers (records and the first to
+  last timestamp); the buffer holds the newest 2000 records (about 36 KB of RAM).
 - Three selectable themes: light, dark and high contrast (chart and PNG export
   follow the selected theme).
 - **Administration** at `/admin`: network settings (Ethernet, AP, NTP), manual
@@ -132,10 +159,10 @@ MANUAL), otherwise `millis()`.
 |---|---|
 | `/` | HTML page with the chart |
 | `/admin` | administration (GET shows the form, POST saves) |
-| `/api/status` | JSON: time, networks, records, current values, theme, OTA name, NTP retry counter, re-dated record count, file-list version (`filesVer`), free heap, SD card health (`sdOk`, `sdFreeMb`, `sdUsedPct`, `lastWriteAgeSec`, `writeFails`) and `resetReason` |
+| `/api/status` | JSON: time, networks, records, current values, theme, OTA name, NTP retry counter, re-dated record count, file-list version (`filesVer`), free heap, SD card health (`sdOk`, `sdFreeMb`, `sdUsedPct`, `lastWriteAgeSec`, `writeFails`), `resetReason` and the factory-password flags (`defaultAdminPwd`, `defaultApPwd`) |
 | `/api/data?f=&since=` | JSON records of a single file (`oldest`/`newest`; `since` returns only the rows after that timestamp) |
 | `/api/data?from=&to=` | JSON records across all files covering a range |
-| `/api/files` | JSON list of files on the card (cached; `version`, `count`, `truncated`, `scanMs`) |
+| `/api/files` | JSON list of files on the card (cached; `version`, `count`, `truncated`, `scanMs`; each file carries `from`/`to` so the table can show its span) |
 | `/download?f=` | download a file |
 | `/delete` | delete a file using authenticated POST form data `f` (the active one is protected) |
 | `/export?from=&to=` | CSV download of the records in a range (chart untouched) |

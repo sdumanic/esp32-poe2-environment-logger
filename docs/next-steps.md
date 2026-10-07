@@ -1,7 +1,7 @@
 > **What this is:** a self-contained brief for the next engineer or AI agent that continues this
 > project - context, rules, planned improvements with acceptance criteria and the verification
 > steps. It is written in English on purpose, like everything else in this repository.
-> P1 is implemented (see the note under it); the remaining items are still open.
+> P1-P10 are implemented (see the notes under each item); P11 is still open.
 
 # Task: harden and polish the ESP32-POE2 environment logger
 
@@ -105,6 +105,10 @@ because serial output is disabled; the CSV simply stops growing.
 
 ### P2 - Optional "one file per day"
 
+**Status: implemented.** `dailyFile` on `/admin` makes `buildFileName()` and the re-dating step
+use `/pms_YYYYMMDD_000000.csv`, so every restart of a day continues in the same file;
+`sameCsvDate()` keeps the range logic correct on the day the option is switched on.
+
 Today every restart (including every OTA) opens a new CSV named after the boot time, so the
 card is full of tiny files (currently 68 files, 42 of them below 20 KB).
 
@@ -126,6 +130,12 @@ card is full of tiny files (currently 68 files, 42 of them below 20 KB).
 
 ### P3 - Fewer writes (card wear and log size)
 
+**Status: implemented.** `writeDeltaTemp` (0.2 degC) and `writeDeltaHum` (0.5 %) are editable on
+`/admin`, together with an optional `pmStep` (0 = the original "write every PM change" rule) and
+a heartbeat that still writes a row at least every 5 minutes while values differ. Measured on
+the device: 18.7 rows/min before, 14 rows/min with the environment steps alone (PM dithering
+dominates in this room), and 4.6 rows/min with `pmStep=2`.
+
 Measured today: 555 records in 28 minutes (~1 record every 3 s, ~1.5 MB/day) because the
 AM2302 dithers by 0.1 degC and every change is logged.
 
@@ -139,6 +149,10 @@ AM2302 dithers by 0.1 degC and every change is logged.
    (temperature/humidity resolution in the CSV).
 
 ### P4 - Make the live chart window explicit
+
+**Status: implemented.** `RING_MAX` is 2000 records (about 36 KB of RAM; the board reports
+~113 KB of free heap afterwards) and the Live caption shows the number of records plus the first
+and last timestamp the buffer covers.
 
 `RING_MAX` is 500 records, which at 3 s per record is only ~25 minutes, and the page does not
 say so.
@@ -164,6 +178,12 @@ watchdog.
 
 ### P6 - Same-origin check for state-changing requests
 
+**Status: implemented.** `sameOriginRequest()` is used by `handleDelete()` and
+`handleAdminPost()`: a request whose `Origin`/`Referer` points at another host is refused with
+403, while requests without those headers (curl, scripts) keep working. Note that
+`server.collectHeaders()` must be called in `startWebServer()`, otherwise WebServer does not
+keep those request headers at all and the check silently passes everything.
+
 `/delete` is a normal form POST behind HTTP Basic auth; browsers resend cached Basic
 credentials, so a malicious page on the same LAN could trigger a delete.
 
@@ -176,6 +196,11 @@ credentials, so a malicious page on the same LAN could trigger a delete.
 
 ### P7 - Factory credential warning
 
+**Status: implemented.** `/api/status` reports `defaultAdminPwd`/`defaultApPwd`, the page shows a
+yellow banner while either is still the documented default, and `/admin` has a **Generate**
+button that fills the AP password field with a random 12-character WPA2-safe value generated in
+the browser.
+
 The default admin password and the AP password are documented publicly.
 
 1. Report `defaultAdminPwd` and `defaultApPwd` (bools) in `/api/status`.
@@ -186,12 +211,20 @@ The default admin password and the AP password are documented publicly.
 
 ### P8 - AM2302 retry
 
+**Status: implemented.** `readDht22()` now retries a failed frame up to three times (2 ms apart)
+before counting it as a sensor error; `readDht22Once()` holds the original bit-banged read.
+
 `dhtBad` occasionally increments by one for no reason.
 
 1. In `readDht22()`, retry a failed read up to 3 times (a few ms apart) before counting it as
    bad. Keep the 3 s minimum read interval and the non-blocking behaviour of `loop()`.
 
 ### P9 - File list: span and retention
+
+**Status: implemented.** `/api/files` carries `from`/`to` for every file (derived from the names
+only) and the table shows the covered span. `retentionDays` on `/admin` removes older files at
+boot, or immediately with **Delete older files now**; the active file is never touched and 0
+keeps everything.
 
 1. In the file table show the covered time span derived from the file names (start from the
    file name, end = the next file's start, as the history code does) - no need to open the
@@ -202,6 +235,10 @@ The default admin password and the AP password are documented publicly.
    active file and never delete anything while retention is 0.
 
 ### P10 - Small UI/network polish
+
+**Status: implemented.** `/` is served with an ETag and answers `304 Not Modified` (the
+comparison tolerates quoted and unquoted validators); the page stops its two timers while the
+tab is hidden and refreshes once when it becomes visible again.
 
 1. Serve `/` with an `ETag` (hash of the page) and answer `304 Not Modified` when the browser
    already has it. The page is ~38 KB.
