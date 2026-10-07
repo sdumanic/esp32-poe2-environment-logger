@@ -80,6 +80,14 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
   about 30 s now finishes well under a second).
 - CSV rows are parsed by hand instead of with `sscanf()`, which roughly halves the
   cost of reading a file.
+- The SD card is monitored while logging (the serial console is disabled, so a
+  dead or full card would otherwise stop the log silently). `/api/status`
+  reports `sdOk`, `sdFreeMb`, `sdUsedPct`, `lastWriteAgeSec` and `writeFails`,
+  and the page shows a red banner when the card is not ready, when nothing has
+  been written for a minute, or when it runs out of space. The free-space
+  numbers come from the card on a 30 s timer, never inside a request. While
+  writes keep failing the card is remounted every 30 s, so a card that was
+  pulled out and pushed back in starts working again without a restart.
 - The file list shows the newest 15 files per page with page navigation.
 - The environment chart uses two axes (temperature on the left with an auto
   range, humidity 0-100 % on the right) and the caption shows min/avg/max plus
@@ -120,7 +128,7 @@ MANUAL), otherwise `millis()`.
 |---|---|
 | `/` | HTML page with the chart |
 | `/admin` | administration (GET shows the form, POST saves) |
-| `/api/status` | JSON: time, networks, records, current values, theme, OTA name, NTP retry counter, re-dated record count, file-list version (`filesVer`) and free heap |
+| `/api/status` | JSON: time, networks, records, current values, theme, OTA name, NTP retry counter, re-dated record count, file-list version (`filesVer`), free heap and SD card health (`sdOk`, `sdFreeMb`, `sdUsedPct`, `lastWriteAgeSec`, `writeFails`) |
 | `/api/data?f=&since=` | JSON records of a single file (`oldest`/`newest`; `since` returns only the rows after that timestamp) |
 | `/api/data?from=&to=` | JSON records across all files covering a range |
 | `/api/files` | JSON list of files on the card (cached; `version`, `count`, `truncated`, `scanMs`) |

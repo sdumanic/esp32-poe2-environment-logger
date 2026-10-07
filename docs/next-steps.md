@@ -1,7 +1,7 @@
 > **What this is:** a self-contained brief for the next engineer or AI agent that continues this
 > project - context, rules, planned improvements with acceptance criteria and the verification
-> steps. It is written in English on purpose, like everything else in this repository. Nothing
-> described here is implemented yet.
+> steps. It is written in English on purpose, like everything else in this repository.
+> P1 is implemented (see the note under it); the remaining items are still open.
 
 # Task: harden and polish the ESP32-POE2 environment logger
 
@@ -80,6 +80,12 @@ numbers.
 ## 4. What to implement
 
 ### P1 - SD card health and write monitoring (highest value: prevents silent data loss)
+
+**Status: implemented.** `/api/status` reports `sdOk`, `sdFreeMb`, `sdUsedPct`,
+`lastWriteAgeSec` and `writeFails`; the page shows a red banner when the card is not ready, when
+nothing has been written for a minute or when it runs out of space; the free-space numbers are
+refreshed on a 30 s timer instead of inside a request; and while writes keep failing the card is
+remounted every 30 s so a card that was pulled out and pushed back in recovers on its own.
 
 Today, if the card is missing, full or failing, `writeRow()` returns false and nobody notices
 because serial output is disabled; the CSV simply stops growing.

@@ -12,7 +12,9 @@
     /               HTML: graph, current values, file list
     /admin          administration: network settings and manual time
     /api/status     JSON: time, networks, records, current values, OTA,
-                    file-list version ("filesVer") and free heap
+                    file-list version ("filesVer"), free heap and SD card
+                    health ("sdOk", "sdFreeMb", "sdUsedPct",
+                    "lastWriteAgeSec", "writeFails")
     /api/data       JSON: records for the graph (?f=file[&since=ts] or ?from=&to=)
     /api/files      JSON: files on the card (cached, see below)
     /download?f=    download a file
@@ -45,6 +47,16 @@
     - A history query or a CSV range export opens only the files whose span
       overlaps the requested range, and CSV rows are parsed by hand instead of
       with sscanf() (a full day is tens of thousands of lines).
+
+  SD card health (the serial console is disabled, so a dead or full card has to
+  be visible on the web page):
+    - Every failed row write is counted and the time of the last successful one
+      is remembered; /api/status publishes both. The page shows a red banner
+      when the card is not ready, when nothing has been written for a minute, or
+      when it runs out of space. The free-space numbers are read from the card
+      on a 30 s timer, never inside a request.
+    - While writes keep failing the card is remounted every 30 s, so a card that
+      was pulled out and pushed back in starts working again without a restart.
 
   OTA: the board can be flashed over the network (ArduinoOTA), no USB:
       arduino-cli upload -p <IP> --fqbn esp32:esp32:esp32wrover \
@@ -210,6 +222,18 @@ static pms5003data pms;
 static fs::FS     *sdFs         = nullptr;
 static bool        sdReady      = false;
 static char        csvPath[48]  = "";
+
+// ---- SD card health (surfaced in /api/status and as a banner on the page) ----
+// The serial console is disabled, so a card that goes missing, fails or fills up
+// has to be visible in the web UI - otherwise the log would stop silently.
+static uint32_t sdLastWriteOkMs = 0;       // millis() of the last written row
+static bool     sdEverWrote     = false;   // at least one row was written
+static uint32_t sdWriteFails    = 0;       // failed row writes since boot
+static uint32_t sdLastFailMs    = 0;       // millis() of the last failed write
+static uint32_t sdRemountMs     = 0;       // millis() of the last remount attempt
+static uint64_t sdTotalB        = 0;       // refreshed by refreshSdStats()
+static uint64_t sdUsedB         = 0;
+static uint32_t sdStatsMs       = 0;       // millis() of the last refresh
 
 static bool        ethActive    = false;      // Ethernet link + IP
 static bool        ntpSynced    = false;
@@ -1013,10 +1037,62 @@ static void checkRotation() {
   }
 }
 
+// Reads the FAT free-space counters. f_getfree() talks to the card, so this is
+// never called from a request handler: the values are refreshed on a timer, and
+// straight after a write failure - which is exactly when they matter.
+static void refreshSdStats() {
+  sdStatsMs = millis();
+  if (sdFs == nullptr || !sdReady) {
+    sdTotalB = 0;
+    sdUsedB  = 0;
+    return;
+  }
+  sdTotalB = SD_MMC.totalBytes();
+  sdUsedB  = SD_MMC.usedBytes();
+  if (sdUsedB > sdTotalB) {
+    sdUsedB = sdTotalB;
+  }
+}
+
+// Watches the card while the logger runs. Every failed row is counted, and while
+// the card is failing, was never mounted or has gone away it is remounted (and
+// the current file reopened) every 30 s: a card that was pulled out and pushed
+// back in starts working again without a restart, because otherwise the old
+// (dead) handle keeps answering and a card inserted later is never noticed.
+// The attempts are throttled, so a card that is really gone costs almost nothing.
+static void pollSd() {
+  const uint32_t now = millis();
+  const bool failing = (sdWriteFails > 0) && (sdLastFailMs != 0) &&
+                       ((now - sdLastFailMs) < 60000UL);
+  const bool cardDown = (sdFs == nullptr) || !sdReady;
+
+  if ((failing || cardDown) && (now - sdRemountMs) > 30000UL) {
+    sdRemountMs = now;
+    SLOG.println("[SD] Retrying the card");
+    if (sdFs != nullptr) {
+      SD_MMC.end();
+      sdFs = nullptr;
+    }
+    sdReady = false;
+    if (mountSD()) {
+      sdReady = prepareCsv();        // continues the current file when it exists
+      fileListInvalidate();
+    }
+    refreshSdStats();
+    return;
+  }
+
+  if ((now - sdStatsMs) >= 30000UL) {
+    refreshSdStats();
+  }
+}
+
 static bool writeRow(uint32_t ts, const char *source,
                      uint16_t pm1, uint16_t pm25, uint16_t pm100,
                      float temp, float hum) {
   if (sdFs == nullptr) {
+    sdWriteFails++;
+    sdLastFailMs = millis();
     return false;
   }
   File f = sdFs->open(csvPath, FILE_APPEND);
@@ -1024,6 +1100,8 @@ static bool writeRow(uint32_t ts, const char *source,
     SLOG.print("[SD] ERROR: cannot open ");
     SLOG.print(csvPath);
     SLOG.println(" for writing");
+    sdWriteFails++;                        // surfaced in /api/status and the page
+    sdLastFailMs = millis();
     return false;
   }
   // The whole line is formatted once and written with a single call: a dozen
@@ -1043,6 +1121,8 @@ static bool writeRow(uint32_t ts, const char *source,
   }
   f.close();
   recordCount++;
+  sdEverWrote     = true;                  // for lastWriteAgeSec in /api/status
+  sdLastWriteOkMs = millis();
 
   if (ringValid && strcmp(ringFile.c_str(), csvPath) == 0) {
     ringPush(ts, pm1, pm25, pm100, temp, hum, parseTimeSource(source));
@@ -1581,6 +1661,11 @@ a:hover{text-decoration:underline}
 .help:hover{color:var(--accent)}
 .muted{color:var(--muted);font-size:12px}
 .stale{opacity:.45}
+.banner{display:none;gap:10px;align-items:baseline;padding:11px 14px;margin-bottom:14px;border-radius:var(--r);
+  background:#fee2e2;border:1px solid #fca5a5;color:#7f1d1d;font-size:13.5px;font-weight:650}
+.banner span{font-weight:400}
+body.theme-dark .banner{background:#3f1d1d;border-color:#7f1d1d;color:#fecaca}
+body.theme-contrast .banner{background:#000;border-color:#ff3b30;color:#ff3b30;border-width:2px}
 canvas{width:100%;height:320px;display:block;border:1px solid var(--line);border-radius:12px;background:var(--card)}
 #chartEnv{height:220px}
 .vals{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin-top:8px}
@@ -1630,6 +1715,8 @@ tbody tr:last-child td{border-bottom:none}
     <div class="kv">Wireless (AP): <b id="apinfo">-</b></div>
   </div>
 </div>
+
+<div class="banner" id="sdwarn"><b id="sdwarnhead"></b><span id="sdwarnbody"></span></div>
 
 <div class="card">
   <div class="kv" style="margin-bottom:8px">Graph of PM1.0 / PM2.5 / PM10 changes (refreshes on every new record)</div>
@@ -1874,6 +1961,7 @@ function pollStatus(){
         : "disabled";
     renderSensorState(s);
     renderDhtState(s);
+    renderSdHealth(s);
     if (s.epoch > 1000000000) { boardEpoch = s.epoch; }
     currentFile = s.file;
     if (selFile === "") { selFile = s.file; q("file").textContent = selFile; }
@@ -1889,6 +1977,42 @@ function pollStatus(){
       if (mode === "file" && selFile === s.file) { loadData(true); }
     }
   }).catch(function(){});
+}
+
+/* The serial console is disabled, so a card that stops taking records (missing,
+   full, failing) can only be reported here. The banner stays hidden while
+   everything is fine. */
+function fmtAge(sec){
+  if (sec < 60)   { return sec + " s"; }
+  if (sec < 3600) { return Math.floor(sec / 60) + " min " + (sec % 60) + " s"; }
+  return Math.floor(sec / 3600) + " h " + Math.floor((sec % 3600) / 60) + " min";
+}
+
+function renderSdHealth(s){
+  var el    = q("sdwarn");
+  var head  = q("sdwarnhead");
+  var body  = q("sdwarnbody");
+  var msgs  = [];
+  var age     = (typeof s.lastWriteAgeSec === "number") ? s.lastWriteAgeSec : -1;
+  var freeMb  = (typeof s.sdFreeMb === "number") ? s.sdFreeMb : -1;
+  var usedPct = (typeof s.sdUsedPct === "number") ? s.sdUsedPct : 0;
+
+  if (s.sdOk === false) { msgs.push("the card is not ready"); }
+  if (age >= 60) { msgs.push("no record written for " + fmtAge(age)); }
+  if (s.sdOk !== false && freeMb >= 0 && (freeMb < 50 || usedPct >= 90)) {
+    msgs.push("only " + freeMb + " MB free (" + usedPct + " % used)");
+  }
+  if (!msgs.length) {
+    el.style.display = "none";
+    head.textContent = "";
+    body.textContent = "";
+    return;
+  }
+
+  if (s.writeFails > 0) { msgs.push(s.writeFails + " failed writes since start"); }
+  head.textContent = "SD card problem:";
+  body.textContent = " " + msgs.join("; ") + ".";
+  el.style.display = "flex";
 }
 
 function renderSensorState(s){
@@ -2595,6 +2719,19 @@ static void handleAdminGet() {
   h += String(timeSourceName());
   h += F(" | SD: ");
   h += (sdReady ? F("OK") : F("not available"));
+  if (sdReady && sdTotalB > 0) {                  // cached by refreshSdStats()
+    const uint64_t freeB = (sdTotalB > sdUsedB) ? (sdTotalB - sdUsedB) : 0;
+    h += F(" (");
+    h += String((unsigned long)(freeB / (1024ULL * 1024ULL)));
+    h += F(" MB free, ");
+    h += String((unsigned)((sdUsedB * 100ULL) / sdTotalB));
+    h += F(" % used)");
+  }
+  if (sdWriteFails > 0) {
+    h += F(" - ");
+    h += String(sdWriteFails);
+    h += F(" failed writes");
+  }
   h += F(" | file: ");
   h += String(csvPath);
   h += F("</p>");
@@ -2775,7 +2912,16 @@ static void handleStatus() {
       "disabled";
 #endif
 
-  char j[1400];
+  // SD card health. The free-space numbers come from the card itself
+  // (f_getfree), so they are cached by refreshSdStats() and never measured
+  // inside a request - this endpoint is polled every two seconds.
+  const bool sdOkNow = (sdFs != nullptr && sdReady);
+  const uint64_t sdFreeB = (sdTotalB > sdUsedB) ? (sdTotalB - sdUsedB) : 0;
+  const unsigned long sdFreeMb = (unsigned long)(sdFreeB / (1024ULL * 1024ULL));
+  const unsigned sdUsedPct = (sdTotalB > 0) ? (unsigned)((sdUsedB * 100ULL) / sdTotalB) : 0;
+  const long lastWriteAge = sdEverWrote ? (long)((millis() - sdLastWriteOkMs) / 1000UL) : -1L;
+
+  char j[1600];
   int n = snprintf(
       j, sizeof(j),
       "{\"records\":%lu,\"file\":\"%s\",\"net\":\"%s\",\"source\":\"%s\","
@@ -2783,6 +2929,8 @@ static void handleStatus() {
       "\"time\":\"%s\",\"boot\":\"%s\",\"uptime\":%lu,\"ageSec\":%lu,"
       "\"framesOk\":%lu,\"framesBad\":%lu,\"dhtOk\":%s,\"dhtGood\":%lu,"
       "\"dhtBad\":%lu,\"dhtAgeSec\":%ld,\"filesVer\":%lu,\"heap\":%lu,"
+      "\"sdOk\":%s,\"sdFreeMb\":%lu,\"sdUsedPct\":%u,\"lastWriteAgeSec\":%ld,"
+      "\"writeFails\":%lu,"
       "\"ethActive\":%s,\"ethDhcp\":%s,\"ethIp\":\"%s\",\"ethMask\":\"%s\","
       "\"ethGw\":\"%s\",\"ethMac\":\"%s\","
       "\"apEnabled\":%s,\"apSsid\":\"%s\",\"apIp\":\"%s\",\"apChannel\":%u,"
@@ -2796,6 +2944,8 @@ static void handleStatus() {
       (unsigned long)dhtGood, (unsigned long)dhtBad,
       (long)(dhtEverOk ? (long)((millis() - dhtLastGoodMs) / 1000UL) : -1L),
       (unsigned long)filesVersion, (unsigned long)ESP.getFreeHeap(),
+      jsonBool(sdOkNow), sdFreeMb, sdUsedPct, lastWriteAge,
+      (unsigned long)sdWriteFails,
       jsonBool(ethActive), jsonBool(settings.ethDhcp), ipS.c_str(),
       maskS.c_str(), gwS.c_str(), macS.c_str(),
       jsonBool(settings.apEnabled), settings.apSsid, apIpS.c_str(),
@@ -3260,6 +3410,7 @@ void setup() {
   if (sdReady) {
     sdReady = prepareCsv();
   }
+  refreshSdStats();                      // first free-space reading for the UI
   rememberRotationDate();
 
   // ---------- 7. Web server (Ethernet or AP) ----------
@@ -3315,6 +3466,7 @@ void loop() {
   // records written with millis() are re-dated and the file renamed.
   pollNetwork();
   pollNtp();
+  pollSd();                              // card health, remount after failures
   if (!timeWasValid && epochValid()) {
     timeWasValid = true;
     if (repairActiveFile()) {
