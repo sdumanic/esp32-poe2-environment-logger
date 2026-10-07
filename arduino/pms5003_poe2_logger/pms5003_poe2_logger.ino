@@ -15,7 +15,7 @@
     /api/data       JSON: records for the graph (?f=file or ?from=&to=)
     /api/files      JSON: files on the card
     /download?f=    download a file
-    /delete?f=      delete a file (the active one is protected)
+    /delete          authenticated POST: delete f (active file is protected)
 
   Networks:
     - Ethernet (LAN8720) is the primary link; DHCP or static IP
@@ -126,7 +126,8 @@
 // ---- OTA (network update) ----
 #define OTA_ENABLE      1
 #define OTA_HOSTNAME    "esp32-poe2-pms"
-#define OTA_PASSWORD    ""
+#define ADMIN_USER      "admin"
+#define DEF_ADMIN_PASSWORD "pms5003admin"
 
 // ---- Default network settings (editable on /admin) ----
 #define DEF_ETH_IP      "192.168.3.50"
@@ -165,6 +166,7 @@ struct DeviceSettings {
   uint8_t apChannel;
   char    ntpServer[64];
   char    theme[16];
+  char    adminPassword[65];
 };
 
 static DeviceSettings settings;
@@ -261,7 +263,31 @@ struct LogRow {
   uint16_t pm100;
   float    temp;
   float    hum;
+  uint8_t  source;
 };
+
+enum LogTimeSource : uint8_t {
+  LOG_TIME_UNKNOWN = 0,
+  LOG_TIME_MILLIS,
+  LOG_TIME_NTP,
+  LOG_TIME_MANUAL
+};
+
+static uint8_t parseTimeSource(const char *source) {
+  if (strcmp(source, "MILLIS") == 0) return LOG_TIME_MILLIS;
+  if (strcmp(source, "NTP") == 0)    return LOG_TIME_NTP;
+  if (strcmp(source, "MANUAL") == 0) return LOG_TIME_MANUAL;
+  return LOG_TIME_UNKNOWN;
+}
+
+static const char *logTimeSourceName(uint8_t source) {
+  switch (source) {
+    case LOG_TIME_MILLIS: return "MILLIS";
+    case LOG_TIME_NTP:    return "NTP";
+    case LOG_TIME_MANUAL: return "MANUAL";
+    default:              return "UNKNOWN";
+  }
+}
 
 static LogRow  ring[RING_MAX];
 static int     ringCount = 0;
@@ -346,6 +372,7 @@ static void loadSettings() {
   settings.apChannel = DEF_AP_CHANNEL;
   strlcpy(settings.ntpServer,   NTP_SERVER,       sizeof(settings.ntpServer));
   strlcpy(settings.theme,       "light",          sizeof(settings.theme));
+  strlcpy(settings.adminPassword, DEF_ADMIN_PASSWORD, sizeof(settings.adminPassword));
 
   if (!prefs.begin(NVS_NAMESPACE, true)) {
     return;                                   // no stored settings
@@ -363,10 +390,14 @@ static void loadSettings() {
   s = prefs.getString("aploz",    settings.apPassword);  strlcpy(settings.apPassword, s.c_str(), sizeof(settings.apPassword));
   s = prefs.getString("ntp",      settings.ntpServer);   strlcpy(settings.ntpServer,  s.c_str(), sizeof(settings.ntpServer));
   s = prefs.getString("theme",    settings.theme);      strlcpy(settings.theme,      s.c_str(), sizeof(settings.theme));
+  s = prefs.getString("adminpwd", settings.adminPassword); strlcpy(settings.adminPassword, s.c_str(), sizeof(settings.adminPassword));
   prefs.end();
 
   if (settings.apChannel < 1 || settings.apChannel > 13) {
     settings.apChannel = DEF_AP_CHANNEL;
+  }
+  if (strlen(settings.adminPassword) < 8) {
+    strlcpy(settings.adminPassword, DEF_ADMIN_PASSWORD, sizeof(settings.adminPassword));
   }
 }
 
@@ -386,6 +417,7 @@ static void saveSettings() {
   prefs.putString("aploz",    settings.apPassword);
   prefs.putString("ntp",      settings.ntpServer);
   prefs.putString("theme",    settings.theme);
+  prefs.putString("adminpwd", settings.adminPassword);
   prefs.end();
 }
 
@@ -398,7 +430,8 @@ static void ringReset(const String &file) {
   ringValid = true;
 }
 
-static void ringPush(uint32_t ts, uint16_t a, uint16_t b, uint16_t c, float tf, float hf) {
+static void ringPush(uint32_t ts, uint16_t a, uint16_t b, uint16_t c,
+                     float tf, float hf, uint8_t source) {
   int idx;
   if (ringCount < RING_MAX) {
     idx = (ringHead + ringCount) % RING_MAX;
@@ -413,6 +446,7 @@ static void ringPush(uint32_t ts, uint16_t a, uint16_t b, uint16_t c, float tf, 
   ring[idx].pm100 = c;
   ring[idx].temp  = tf;
   ring[idx].hum   = hf;
+  ring[idx].source = source;
 }
 
 // Loads a CSV file into the ring (last RING_MAX records). If the ring already
@@ -432,6 +466,7 @@ static bool parseCsvLine(const char *line, LogRow &r) {
   r.pm100 = (uint16_t)c;
   r.temp  = tf;
   r.hum   = hf;
+  r.source = parseTimeSource(source);
   return true;
 }
 
@@ -461,7 +496,7 @@ static bool loadIntoRing(const String &file) {
       if (line[0] >= 48 && line[0] <= 57) {
         LogRow r;
         if (parseCsvLine(line, r)) {
-          ringPush(r.ts, r.pm1, r.pm25, r.pm100, r.temp, r.hum);
+          ringPush(r.ts, r.pm1, r.pm25, r.pm100, r.temp, r.hum, r.source);
         }
       }
       line = nl + 1;
@@ -475,7 +510,7 @@ static bool loadIntoRing(const String &file) {
     if (buf[0] >= 48 && buf[0] <= 57) {
       LogRow r;
       if (parseCsvLine(buf, r)) {
-        ringPush(r.ts, r.pm1, r.pm25, r.pm100, r.temp, r.hum);
+        ringPush(r.ts, r.pm1, r.pm25, r.pm100, r.temp, r.hum, r.source);
       }
     }
   }
@@ -604,12 +639,12 @@ static bool loadHistoryRange(uint32_t from, uint32_t till) {
   if (sdFs == nullptr || !histEnsure()) {
     return false;
   }
-  histReset();
 
   // A closed range never changes, so the previous result can be reused
   if (histCacheValid && till != 0 && from == histCacheFrom && till == histCacheTill) {
     return true;
   }
+  histReset();
   histCacheValid = false;
 
   String names[64];
@@ -852,7 +887,7 @@ static bool writeRow(uint32_t ts, const char *source,
   recordCount++;
 
   if (ringValid && ringFile == String(csvPath)) {
-    ringPush(ts, pm1, pm25, pm100, temp, hum);
+    ringPush(ts, pm1, pm25, pm100, temp, hum, parseTimeSource(source));
   }
   return true;
 }
@@ -1831,12 +1866,22 @@ function renderFiles(){
       td3.appendChild(document.createTextNode(" | (active)"));
     } else {
       td3.appendChild(document.createTextNode(" | "));
-      var a3 = document.createElement("a");
-      a3.textContent = "delete";
-      a3.className = "del";
-      a3.href = "/delete?f=" + encodeURIComponent(f.name);
-      a3.onclick = function(){ return confirm("Delete " + f.name + " ?"); };
-      td3.appendChild(a3);
+      var form = document.createElement("form");
+      form.method = "POST";
+      form.action = "/delete";
+      form.style.display = "inline";
+      form.onsubmit = function(){ return confirm("Delete " + f.name + " ?"); };
+      var hidden = document.createElement("input");
+      hidden.type = "hidden";
+      hidden.name = "f";
+      hidden.value = f.name;
+      form.appendChild(hidden);
+      var del = document.createElement("button");
+      del.type = "submit";
+      del.textContent = "delete";
+      del.className = "del";
+      form.appendChild(del);
+      td3.appendChild(form);
     }
 
     tr.appendChild(td3);
@@ -2249,7 +2294,16 @@ p{margin:8px 0}
 @media(max-width:640px){body{padding:10px}.card{padding:13px}td:first-child{width:auto}}
 )CSS";
 
+static bool requireAdminAuth() {
+  if (server.authenticate(ADMIN_USER, settings.adminPassword)) {
+    return true;
+  }
+  server.requestAuthentication(BASIC_AUTH, "ESP32-POE2 administration");
+  return false;
+}
+
 static void handleAdminGet() {
+  if (!requireAdminAuth()) return;
   String h = F("<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">");
   h += F("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
   h += F("<title>Administration - ESP32-POE2</title><style>");
@@ -2313,6 +2367,14 @@ static void handleAdminGet() {
   h += F(">High contrast</option></select> ");
   h += F("<button type=\"submit\">Save theme</button></p></form>");
 
+  // --- administration password ---
+  h += F("<hr><h3>Administration access</h3>");
+  h += F("<p class=\"muted\">HTTP user: admin. The same password protects ArduinoOTA. Use at least 8 characters.</p>");
+  h += F("<form method=\"POST\" action=\"/admin\">");
+  h += F("<input type=\"hidden\" name=\"action\" value=\"security\">");
+  h += F("<p><input type=\"password\" name=\"adminpwd\" minlength=\"8\" maxlength=\"64\" autocomplete=\"new-password\" placeholder=\"New password\"> ");
+  h += F("<button type=\"submit\">Change password</button></p></form>");
+
   // --- form 2: manual time ---
   // --- firmware update ---
   h += F("<h3>Firmware update</h3>");
@@ -2347,6 +2409,7 @@ static void handleAdminGet() {
 }
 
 static void handleAdminPost() {
+  if (!requireAdminAuth()) return;
   String action = server.arg("action");
   String message;
 
@@ -2386,6 +2449,21 @@ static void handleAdminPost() {
       message = F("Theme saved.");
     } else {
       message = F("Invalid theme.");
+    }
+  }
+
+  // Administration and ArduinoOTA password
+  if (action == "security") {
+    String password = server.arg("adminpwd");
+    if (password.length() >= 8 && password.length() <= 64) {
+      strlcpy(settings.adminPassword, password.c_str(), sizeof(settings.adminPassword));
+      saveSettings();
+#if OTA_ENABLE
+      ArduinoOTA.setPassword(settings.adminPassword);
+#endif
+      message = F("Administration password changed. Use the new password next time.");
+    } else {
+      message = F("Password must contain between 8 and 64 characters.");
     }
   }
 
@@ -2461,14 +2539,16 @@ static void handleRoot() {
   server.sendContent("");
 }
 
-// Serialises one record as a JSON array: [ts,pm1,pm25,pm100,temp,hum]
+// Serialises one record as a JSON array:
+// [ts,pm1,pm25,pm100,temp,hum,time_source]
 static void rowJson(char *out, size_t n, const LogRow &r, bool first) {
   char tbuf[16] = "null";
   char hbuf[16] = "null";
   if (!isnan(r.temp)) { snprintf(tbuf, sizeof(tbuf), "%.1f", r.temp); }
   if (!isnan(r.hum))  { snprintf(hbuf, sizeof(hbuf), "%.1f", r.hum);  }
-  snprintf(out, n, "%s[%lu,%u,%u,%u,%s,%s]", (first ? "" : ","),
-           (unsigned long)r.ts, r.pm1, r.pm25, r.pm100, tbuf, hbuf);
+  snprintf(out, n, "%s[%lu,%u,%u,%u,%s,%s,\"%s\"]", (first ? "" : ","),
+           (unsigned long)r.ts, r.pm1, r.pm25, r.pm100, tbuf, hbuf,
+           logTimeSourceName(r.source));
 }
 
 static void handleStatus() {
@@ -2703,6 +2783,7 @@ static void handleDownload() {
 }
 
 static void handleDelete() {
+  if (!requireAdminAuth()) return;
   String file = server.arg("f");
   if (file.length() == 0 || !file.startsWith("/")) {
     file = "/" + file;
@@ -2746,7 +2827,37 @@ static void nameStamp(uint32_t e, char *out, size_t n) {
            t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
 }
 
-// Downloads every record of the requested range as a CSV file.
+// Finds the lexicographically next CSV file without keeping a fixed-size list
+// in RAM. Repeated directory scans are slower than an array, but this keeps the
+// export complete even after years of daily files and uses constant memory.
+static bool nextCsvNameAfter(const String &after, String &next) {
+  next = "";
+  File root = sdFs->open("/");
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    return false;
+  }
+
+  File f = root.openNextFile();
+  while (f) {
+    if (!f.isDirectory()) {
+      String name = String(f.name());
+      if (!name.startsWith("/")) name = "/" + name;
+      if (name.startsWith(CSV_PREFIX) && name.endsWith(".csv") &&
+          (after.length() == 0 || name > after) &&
+          (next.length() == 0 || name < next)) {
+        next = name;
+      }
+    }
+    f.close();
+    f = root.openNextFile();
+  }
+  root.close();
+  return next.length() > 0;
+}
+
+// Downloads every record of the requested range as a CSV file. This deliberately
+// does not use loadHistoryRange(): that buffer is decimated for chart rendering.
 static void handleExport() {
   String fromArg = server.arg("from");
   String tillArg = server.arg("to");
@@ -2754,7 +2865,7 @@ static void handleExport() {
   uint32_t till = tillArg.length() ? (uint32_t)strtoul(tillArg.c_str(), nullptr, 10) : 0;
   if (from > 0 && till > 0 && till < from) { uint32_t t = from; from = till; till = t; }
 
-  if (sdFs == nullptr || !loadHistoryRange(from, till)) {
+  if (sdFs == nullptr) {
     server.send(500, "text/plain", "Cannot read the card.");
     return;
   }
@@ -2771,9 +2882,9 @@ static void handleExport() {
   char row[128];
   char out[1100];
   size_t pos = 0;
-  for (int i = 0; i < histCount; i++) {
-    LogRow r = histBuf[i];
-    const char *src = (r.ts < NTP_EPOCH_MIN) ? "MILLIS" : timeSourceName();
+
+  auto emitRow = [&](const LogRow &r) {
+    const char *src = logTimeSourceName(r.source);
     char tb[16] = "";
     char hb[16] = "";
     if (!isnan(r.temp)) { snprintf(tb, sizeof(tb), "%.1f", r.temp); }
@@ -2789,6 +2900,55 @@ static void handleExport() {
     }
     memcpy(out + pos, row, lr);
     pos += lr;
+  };
+
+  String previous = "";
+  String fileName;
+  while (nextCsvNameAfter(previous, fileName)) {
+    previous = fileName;
+    File f = sdFs->open(fileName, FILE_READ);
+    if (!f || f.isDirectory()) {
+      if (f) f.close();
+      continue;
+    }
+
+    char input[512];
+    size_t inputPos = 0;
+    int rd;
+    bool stopFile = false;
+    while (!stopFile && (rd = f.read((uint8_t *)input + inputPos,
+                                     sizeof(input) - inputPos - 1)) > 0) {
+      inputPos += (size_t)rd;
+      input[inputPos] = 0;
+      char *line = input;
+      char *nl;
+      while ((nl = strchr(line, char(10))) != nullptr) {
+        *nl = 0;
+        if (line[0] >= '0' && line[0] <= '9') {
+          LogRow r;
+          if (parseCsvLine(line, r)) {
+            if (till != 0 && r.ts > till) { stopFile = true; break; }
+            if ((from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
+              emitRow(r);
+            }
+          }
+        }
+        line = nl + 1;
+      }
+      if (stopFile) break;
+      size_t rest = inputPos - (size_t)(line - input);
+      memmove(input, line, rest);
+      inputPos = rest;
+    }
+    if (!stopFile && inputPos > 0) {
+      input[inputPos] = 0;
+      LogRow r;
+      if (parseCsvLine(input, r) &&
+          (from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
+        emitRow(r);
+      }
+    }
+    f.close();
   }
   if (pos > 0) {
     out[pos] = 0;
@@ -2804,6 +2964,7 @@ static void handleFavicon() {
 
 // HTTP firmware update (independent of ArduinoOTA, works from a browser)
 static void handleUpdateDone() {
+  if (!requireAdminAuth()) return;
   if (Update.hasError()) {
     server.send(500, "text/plain", String("Update failed: ") + Update.errorString());
   } else {
@@ -2816,6 +2977,7 @@ static void handleUpdateDone() {
 }
 
 static void handleUpdateUpload() {
+  if (!server.authenticate(ADMIN_USER, settings.adminPassword)) return;
   HTTPUpload &up = server.upload();
   if (up.status == UPLOAD_FILE_START) {
     SLOG.print("[OTA] HTTP update: ");
@@ -2851,7 +3013,7 @@ static void startWebServer() {
   server.on("/api/files", handleFiles);
   server.on("/download", handleDownload);
   server.on("/export", handleExport);
-  server.on("/delete", handleDelete);
+  server.on("/delete", HTTP_POST, handleDelete);
   server.on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   server.on("/favicon.ico", handleFavicon);
   server.onNotFound([]() {
@@ -2950,9 +3112,7 @@ void setup() {
 #if OTA_ENABLE
   if (ethActive || settings.apEnabled) {
     ArduinoOTA.setHostname(OTA_HOSTNAME);
-    if (strlen(OTA_PASSWORD) > 0) {
-      ArduinoOTA.setPassword(OTA_PASSWORD);
-    }
+    ArduinoOTA.setPassword(settings.adminPassword);
     ArduinoOTA.begin();
     SLOG.print("[OTA] Ready: ");
     SLOG.println(OTA_HOSTNAME);

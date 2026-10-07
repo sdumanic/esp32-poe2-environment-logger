@@ -63,8 +63,10 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
 - Quick ranges only fill the From/To fields; the chart is (re)drawn on **Apply
   range** and, in Live view, on every new record. Browsing history therefore never
   slows down logging, and a CSV download never touches the chart.
-- History queries read **all files covering the selected range**, merge and sort
-  them, and decimate evenly when there are more than 3000 records.
+- History queries read the first 64 files covering the selected range, merge and
+  sort them, and decimate evenly when there are more than 1200 records. CSV range
+  export is independent of that chart buffer and always streams every matching
+  record from every CSV file.
 - The file list shows the newest 15 files per page with page navigation.
 - The environment chart uses two axes (temperature on the left with an auto
   range, humidity 0-100 % on the right) and the caption shows min/avg/max plus
@@ -74,9 +76,10 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
 - Three selectable themes: light, dark and high contrast (chart and PNG export
   follow the selected theme).
 - **Administration** at `/admin`: network settings (Ethernet, AP, NTP), manual
-  time setting, theme selection and firmware upload. Settings are stored in NVS
-  (`Preferences`) and survive a restart; changing network settings restarts the
-  device.
+  time setting, theme selection, administration-password change and firmware
+  upload. Administration, deletion and firmware updates require HTTP Basic
+  authentication. Settings are stored in NVS (`Preferences`) and survive a
+  restart; changing network settings restarts the device.
 - Firmware update from the browser (`/admin` → **Firmware update**) as well as
   ArduinoOTA (hostname `esp32-poe2-pms`).
 - Serial output is disabled (`SERIAL_DEBUG 0`).
@@ -84,8 +87,8 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
 ## CSV format
 
 ```
-timestamp,time_source,pm1_0,pm2_5,pm10
-1789733325,NTP,3,7,7
+timestamp,time_source,pm1_0,pm2_5,pm10,temp_c,humidity
+1789733325,NTP,3,7,7,22.4,48.1
 ```
 
 `timestamp` is a Unix epoch (UTC) when the clock has a valid epoch (NTP or
@@ -102,7 +105,7 @@ MANUAL), otherwise `millis()`.
 | `/api/data?from=&to=` | JSON records across all files covering a range |
 | `/api/files` | JSON list of files on the card |
 | `/download?f=` | download a file |
-| `/delete?f=` | delete a file (the active one is protected) |
+| `/delete` | delete a file using authenticated POST form data `f` (the active one is protected) |
 | `/export?from=&to=` | CSV download of the records in a range (chart untouched) |
 | `/update` | firmware upload (POST, multipart) |
 
@@ -172,3 +175,4 @@ on GPIO4 (pin 19), AM2302 VCC on pin 7 (3.3 V), GND on pins 2/4/6/8.
 | Time zone | `CET-1CEST,M3.5.0,M10.5.0/3` (file names and page display only) |
 | Chart range | last 5 minutes |
 | Theme | light |
+| Administration | user `admin`, password `pms5003admin` (change it immediately on `/admin`) |
