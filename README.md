@@ -89,6 +89,10 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
 - The current-value tiles refresh every 5 s from the last `/api/status` response
   instead of starting a second request, and the environment summary under the
   lower chart shows min/avg/max plus the average dew point.
+- In Live view the page asks for the new records only (`/api/data?f=...&since=`),
+  so a refresh transfers a few hundred bytes instead of the whole 500-record
+  buffer; the board reports `oldest` and the page falls back to a full reload
+  when the buffer has rotated past what it already had.
 - Three selectable themes: light, dark and high contrast (chart and PNG export
   follow the selected theme).
 - **Administration** at `/admin`: network settings (Ethernet, AP, NTP), manual
@@ -117,7 +121,7 @@ MANUAL), otherwise `millis()`.
 | `/` | HTML page with the chart |
 | `/admin` | administration (GET shows the form, POST saves) |
 | `/api/status` | JSON: time, networks, records, current values, theme, OTA name, NTP retry counter, re-dated record count, file-list version (`filesVer`) and free heap |
-| `/api/data?f=` | JSON records of a single file |
+| `/api/data?f=&since=` | JSON records of a single file (`oldest`/`newest`; `since` returns only the rows after that timestamp) |
 | `/api/data?from=&to=` | JSON records across all files covering a range |
 | `/api/files` | JSON list of files on the card (cached; `version`, `count`, `truncated`, `scanMs`) |
 | `/download?f=` | download a file |

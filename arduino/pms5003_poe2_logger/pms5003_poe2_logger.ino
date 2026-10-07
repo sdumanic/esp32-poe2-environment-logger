@@ -13,7 +13,7 @@
     /admin          administration: network settings and manual time
     /api/status     JSON: time, networks, records, current values, OTA,
                     file-list version ("filesVer") and free heap
-    /api/data       JSON: records for the graph (?f=file or ?from=&to=)
+    /api/data       JSON: records for the graph (?f=file[&since=ts] or ?from=&to=)
     /api/files      JSON: files on the card (cached, see below)
     /download?f=    download a file
     /delete          authenticated POST: delete f (active file is protected)
@@ -1026,23 +1026,25 @@ static bool writeRow(uint32_t ts, const char *source,
     SLOG.println(" for writing");
     return false;
   }
-  f.print(ts);      f.print(',');
-  f.print(source);  f.print(',');
-  f.print(pm1);     f.print(',');
-  f.print(pm25);    f.print(',');
-  f.print(pm100);
+  // The whole line is formatted once and written with a single call: a dozen
+  // f.print() calls would each go through the FAT layer (and its lock) alone.
+  char line[128];
+  int  len;
   if (dhtEverOk) {
-    f.print(",");   f.print(temp, 1);
-    f.print(",");   f.print(hum, 1);
+    len = snprintf(line, sizeof(line), "%lu,%s,%u,%u,%u,%.1f,%.1f\r\n",
+                   (unsigned long)ts, source, pm1, pm25, pm100,
+                   (double)temp, (double)hum);
   } else {
-    f.print(",");
-    f.print(",");
+    len = snprintf(line, sizeof(line), "%lu,%s,%u,%u,%u,,\r\n",
+                   (unsigned long)ts, source, pm1, pm25, pm100);
   }
-  f.println();
+  if (len > 0) {
+    f.write((const uint8_t *)line, (size_t)((len < (int)sizeof(line)) ? len : (int)sizeof(line) - 1));
+  }
   f.close();
   recordCount++;
 
-  if (ringValid && ringFile == String(csvPath)) {
+  if (ringValid && strcmp(ringFile.c_str(), csvPath) == 0) {
     ringPush(ts, pm1, pm25, pm100, temp, hum, parseTimeSource(source));
   }
   return true;
@@ -1884,7 +1886,7 @@ function pollStatus(){
 
     if (s.records !== lastCount) {
       lastCount = s.records;
-      if (mode === "file" && selFile === s.file) { loadData(); }
+      if (mode === "file" && selFile === s.file) { loadData(true); }
     }
   }).catch(function(){});
 }
@@ -1965,15 +1967,43 @@ function loadRange(){
   }).catch(function(){});
 }
 
-function loadData(){
-  getJSON("/api/data?f=" + encodeURIComponent(selFile)).then(function(d){
-    rows = d.rows || [];
+/* Live view. The first load fetches the whole RAM buffer of the active file;
+   every later refresh adds "since" (the newest timestamp already on screen), so
+   the board answers with the new rows only - a few hundred bytes instead of the
+   whole buffer. Whenever the answer cannot be appended safely (another file,
+   buffer rotated, clock re-dated) the response replaces the chart instead. */
+var liveSince   = 0;      // newest timestamp the chart already holds
+var liveLoading = false;  // one refresh at a time (responses must stay ordered)
+
+function loadData(incremental){
+  if (liveLoading) { return; }
+  var url = "/api/data?f=" + encodeURIComponent(selFile);
+  if (incremental && liveSince > 0) { url += "&since=" + liveSince; }
+  liveLoading = true;
+  getJSON(url).then(function(d){
+    if (!d || !d.rows) { return; }      // error answer: leave the chart as it is
+    var got    = d.rows || [];
+    var oldest = (d.oldest === undefined) ? 0 : d.oldest;
+    if (incremental && liveSince > 0 && oldest > 0 && liveSince >= oldest &&
+        d.file === selFile) {
+      Array.prototype.push.apply(rows, got);      // only the new rows arrived
+    } else {
+      rows = got;                                 // full reload
+    }
+    if (oldest > 0) {                             // drop what the board dropped
+      var keep = [];
+      for (var i = 0; i < rows.length; i++) {
+        if (rows[i][0] >= oldest) { keep.push(rows[i]); }
+      }
+      rows = keep;
+    }
+    if (rows.length) { liveSince = rows[rows.length - 1][0]; }
     srcLabel = d.source || "NTP";
     q("live").className = "on";
     q("chartinfo").textContent = d.file + "  |  total records: " + rows.length +
                                  "  |  time source: " + srcLabel;
     draw();
-  }).catch(function(){});
+  }).catch(function(){}).then(function(){ liveLoading = false; });
 }
 
 function loadFiles(){
@@ -2018,6 +2048,7 @@ function renderFiles(){
       fromEpoch = 0; tillEpoch = 0; rangeSec = 0; rangeFrom = 0; rangeTill = 0;
       q("from").value = ""; q("till").value = ""; q("range").value = "0";
       lastCount = -1;
+      liveSince = 0;                        // a different file: full reload
       q("file").textContent = selFile;
       loadData();
     };
@@ -2331,6 +2362,7 @@ function goLive(){
   rangeFrom = 0;
   rangeTill = 0;
   lastCount = -1;
+  liveSince = 0;                            // back to live: reload the buffer
   q("file").textContent = selFile;
   loadData();
 }
@@ -2876,17 +2908,34 @@ static void handleData() {
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
 
-  char buf[160];
-  snprintf(buf, sizeof(buf), "{\"file\":\"%s\",\"source\":\"%s\",\"count\":%d,\"rows\":[",
-           file.c_str(), timeSourceName(), ringCount);
+  // "since" is the newest timestamp the page already holds: answer with only the
+  // rows after it, so a live refresh costs a few hundred bytes instead of the
+  // whole buffer. "oldest" tells the page whether the buffer still contains
+  // everything it missed (it reloads completely when it does not).
+  const String   sinceArg = server.arg("since");
+  const uint32_t since    = sinceArg.length() ? (uint32_t)strtoul(sinceArg.c_str(), nullptr, 10) : 0;
+  const uint32_t oldest   = (ringCount > 0) ? ring[ringHead].ts : 0;
+  const uint32_t newest   = (ringCount > 0) ? ring[(ringHead + ringCount - 1) % RING_MAX].ts : 0;
+
+  char buf[224];
+  snprintf(buf, sizeof(buf),
+           "{\"file\":\"%s\",\"source\":\"%s\",\"count\":%d,\"oldest\":%lu,"
+           "\"newest\":%lu,\"rows\":[",
+           file.c_str(), timeSourceName(), ringCount,
+           (unsigned long)oldest, (unsigned long)newest);
   server.sendContent(buf);
 
   char row[96];
   char out[2048];
   size_t pos = 0;
+  bool first = true;
   for (int i = 0; i < ringCount; i++) {
     LogRow r = ring[(ringHead + i) % RING_MAX];
-    rowJson(row, sizeof(row), r, (i == 0));
+    if (since != 0 && r.ts <= since) {
+      continue;                       // one the page already has
+    }
+    rowJson(row, sizeof(row), r, first);
+    first = false;
     size_t lr = strlen(row);
     if (pos + lr > sizeof(out) - 1) {
       out[pos] = 0;
@@ -2984,7 +3033,7 @@ static void handleDelete() {
     server.send(400, "text/plain", "Invalid file.");
     return;
   }
-  if (file == String(csvPath)) {
+  if (strcmp(file.c_str(), csvPath) == 0) {          // never delete the active file
     server.send(403, "text/plain",
                 "The active file cannot be deleted. Restart the board with a new "
                 "file or delete it on a computer.");
