@@ -43,6 +43,15 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
   **automatic rotation at midnight** and no board restart.
 - Time: **NTP** when the network is available, **MANUAL** when set from the
   administration page, otherwise **MILLIS** (always recorded in `time_source`).
+- **Clock recovery after a power outage:** if the board is up before the router,
+  the first records go to `/pms_millis_NNNNNNNNNN.csv` with `millis()`
+  timestamps. Ethernet (link + DHCP) and NTP are retried in the background
+  (every 15 s for the first ~5 minutes, then once a minute) instead of only in
+  `setup()`. As soon as a real clock exists - NTP synced late, or the time set on
+  `/admin` - the early rows are re-dated with `epoch = bootEpoch + millis/1000`,
+  `time_source` is set to the clock that made this possible, and the file is
+  renamed to its real start time (`/pms_YYYYMMDD_HHMMSS.csv`). Nothing is deleted
+  before the repaired copy exists, so a failure cannot lose data.
 - Ethernet (DHCP or static IP) plus a **Wi-Fi access point** (SSID, password,
   channel); web UI and OTA work on both networks.
 - Web page: chart with range filters (last 5 min / 30 min / 1 h / 6 h / 24 h and
@@ -88,7 +97,7 @@ MANUAL), otherwise `millis()`.
 |---|---|
 | `/` | HTML page with the chart |
 | `/admin` | administration (GET shows the form, POST saves) |
-| `/api/status` | JSON: time, networks, records, current values, theme, OTA name |
+| `/api/status` | JSON: time, networks, records, current values, theme, OTA name, NTP retry counter and re-dated record count |
 | `/api/data?f=` | JSON records of a single file |
 | `/api/data?from=&to=` | JSON records across all files covering a range |
 | `/api/files` | JSON list of files on the card |

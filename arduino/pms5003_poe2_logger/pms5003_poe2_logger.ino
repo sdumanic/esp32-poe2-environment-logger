@@ -108,6 +108,16 @@
 #define NTP_EPOCH_MIN           1000000000UL
 #define PMS_SILENCE_WARN_MS     5000UL
 
+// ---- Clock recovery after a power outage ----
+// The router can boot after the board, so Ethernet and NTP are retried in the
+// background instead of only in setup().
+#define NET_RETRY_MS            5000UL   // re-check link/DHCP while offline
+#define NTP_RETRY_MS           15000UL   // retry NTP while the clock is invalid
+#define NTP_RETRY_SLOW_MS      60000UL   // ... slower after the fast attempts
+#define NTP_RETRY_FAST_ATTEMPTS     20   // ~5 min at 15 s, then once a minute
+#define NTP_ATTEMPT_TIMEOUT_MS  8000UL   // one SNTP attempt may take this long
+#define REPAIR_TMP_PATH  "/pms_fix.tmp"  // scratch file for the re-dating pass
+
 // ---- Web server and graph ----
 #define WEB_PORT                80
 #define RING_MAX                500     // records kept in RAM for a single file
@@ -211,6 +221,16 @@ static uint32_t    lastPmsMs    = 0;
 static uint32_t    lastWarnMs   = 0;
 static uint32_t    netStartMs   = 0;
 
+// ---- Background network / clock recovery (router may boot after the board) ----
+static uint32_t    ntpAttempts   = 0;      // SNTP attempts made after setup()
+static uint32_t    lastNetCheck  = 0;
+static uint32_t    lastNtpTry    = 0;
+static uint32_t    ntpTryStartMs = 0;
+static bool        ntpPending    = false;  // an SNTP attempt is in flight
+static bool        ethBegan      = false;  // ETH.begin() succeeded
+static bool        webStarted    = false;  // server.begin() was called
+static bool        timeWasValid  = false;  // edge detector: clock became valid
+
 static uint32_t    framesOk  = 0;   // valid 32-byte frames
 static uint32_t    framesBad = 0;   // frames with bad header/checksum
 
@@ -255,6 +275,14 @@ static const char *timeSourceName() {
   if (ntpSynced)  return "NTP";
   if (manualTime) return "MANUAL";
   return "MILLIS";
+}
+
+// configTime() resets the TZ variable to UTC, but the local zone is needed for
+// the CSV file names, the page display and for interpreting the manual time
+// entered on /admin. Re-applied after every configTime() call and once at boot.
+static void applyTimeZone() {
+  setenv("TZ", TZ_INFO, 1);
+  tzset();
 }
 
 static bool epochValid() {
@@ -829,6 +857,166 @@ static bool writeRow(uint32_t ts, const char *source,
   return true;
 }
 
+// ============ CLOCK RECOVERY: RE-DATE THE EARLY MILLIS RECORDS ============
+//
+// After a power outage the board can be ready before the router, so there is no
+// NTP yet and the first records are written with millis() into a file called
+// /pms_millis_NNNNNNNNNN.csv. As soon as a real clock exists - NTP came up
+// later, or the time was set on /admin - the boot epoch is known, so every
+// millis() row can be re-dated with  epoch = bootEpoch + millis/1000  and the
+// file renamed after its real start time. Runs once per boot, from loop().
+
+static uint32_t redatedRows = 0;      // records re-dated since boot (diagnostics)
+
+// Rewrites one data line: the millis() timestamp becomes a real epoch and the
+// time_source column is set to the clock that made the reconstruction possible
+// ("NTP" or "MANUAL"), so the CSV stays consistent with what the page shows.
+// Returns the new length, or 0 when the line is not a millis() data row.
+static size_t redateLine(const char *line, uint32_t epoch, const char *source,
+                         char *out, size_t n) {
+  if (line[0] < '0' || line[0] > '9') {
+    return 0;                                     // header or junk
+  }
+  char *e1 = nullptr;
+  unsigned long v = strtoul(line, &e1, 10);
+  if (e1 == nullptr || *e1 != ',' || v >= (unsigned long)NTP_EPOCH_MIN) {
+    return 0;                                     // already a Unix epoch
+  }
+  const char *rest = e1 + 1;                      // "<source>,pm1,pm2.5,..."
+  const char *e2 = strchr(rest, ',');
+  if (e2 == nullptr) {
+    return 0;
+  }
+  unsigned long ts = (unsigned long)(epoch + (uint32_t)(v / 1000UL));
+  int w = snprintf(out, n, "%lu,%s%s", ts, source, e2);
+  return (w > 0 && (size_t)w < n) ? (size_t)w : 0;
+}
+
+// Copies the active file into a scratch file with the millis() rows re-dated,
+// then renames it after its real start time. Nothing is deleted before the new
+// file exists, so a failure never loses data.
+static bool repairActiveFile() {
+  if (!sdReady || sdFs == nullptr || csvPath[0] == '\0' || bootEpoch == 0) {
+    return false;
+  }
+
+  File src = sdFs->open(csvPath, FILE_READ);
+  if (!src || src.isDirectory()) {
+    if (src) { src.close(); }
+    return false;
+  }
+
+  // Cheap pre-check: the first data line decides whether there is work to do.
+  char head[256];
+  int rd = src.read((uint8_t *)head, sizeof(head) - 1);
+  if (rd <= 0) {
+    src.close();
+    return false;
+  }
+  head[rd] = 0;
+  char *nl = strchr(head, char(10));               // end of the header line
+  if (nl == nullptr) {
+    src.close();
+    return false;
+  }
+  const char *firstRow = nl + 1;
+  char *endp = nullptr;
+  unsigned long firstTs = strtoul(firstRow, &endp, 10);
+  if (endp == firstRow || firstTs >= (unsigned long)NTP_EPOCH_MIN) {
+    src.close();
+    return false;                                  // no millis rows -> nothing to do
+  }
+  uint32_t startEpoch = bootEpoch + (uint32_t)(firstTs / 1000UL);
+
+  src.seek(0);
+  File dst = sdFs->open(REPAIR_TMP_PATH, FILE_WRITE);
+  if (!dst) {
+    src.close();
+    return false;
+  }
+
+  char buf[512];
+  char out[640];
+  size_t pos = 0;
+  bool headerDone = false;
+  const char *srcName = timeSourceName();
+  uint32_t rows = 0, changed = 0;
+  int n;
+  while ((n = src.read((uint8_t *)buf + pos, sizeof(buf) - pos - 1)) > 0) {
+    pos += (size_t)n;
+    buf[pos] = 0;
+    char *line = buf;
+    char *eol;
+    while ((eol = strchr(line, char(10))) != nullptr) {
+      *eol = 0;
+      size_t len = strlen(line);
+      if (len > 0 && line[len - 1] == '\r') { line[--len] = 0; }
+      if (!headerDone) {
+        headerDone = true;                          // header is copied verbatim
+        dst.write((const uint8_t *)line, len);
+      } else if (len > 0) {
+        size_t w = redateLine(line, bootEpoch, srcName, out, sizeof(out));
+        if (w > 0) { changed++; dst.write((const uint8_t *)out, w); }
+        else       { dst.write((const uint8_t *)line, len); }
+        rows++;
+      }
+      dst.write((const uint8_t *)"\r\n", 2);
+      line = eol + 1;
+    }
+    size_t rest = pos - (size_t)(line - buf);
+    memmove(buf, line, rest);
+    pos = rest;
+  }
+  if (pos > 0 && headerDone) {                      // last line without newline
+    buf[pos] = 0;
+    size_t len = strlen(buf);
+    if (len > 0 && buf[len - 1] == '\r') { buf[--len] = 0; }
+    size_t w = redateLine(buf, bootEpoch, srcName, out, sizeof(out));
+    if (w > 0) { changed++; dst.write((const uint8_t *)out, w); rows++; }
+  }
+  dst.close();
+  src.close();
+
+  if (rows == 0 || changed == 0) {
+    sdFs->remove(REPAIR_TMP_PATH);
+    return false;
+  }
+
+  // Name the file after its real first record (local time zone), like a file
+  // that was created when the clock was already valid.
+  char newPath[52];
+  struct tm t;
+  time_t te = (time_t)startEpoch;
+  localtime_r(&te, &t);
+  snprintf(newPath, sizeof(newPath), CSV_PREFIX "%04d%02d%02d_%02d%02d%02d.csv",
+           t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+           t.tm_hour, t.tm_min, t.tm_sec);
+
+  String target = String(newPath);
+  if (sdFs->exists(target)) {                        // never overwrite a file
+    target = target.substring(0, target.length() - 4) + "_b.csv";
+  }
+  if (!sdFs->rename(REPAIR_TMP_PATH, target.c_str())) {
+    SLOG.print("[TIME] Rename failed, repaired data kept in ");
+    SLOG.println(REPAIR_TMP_PATH);
+    return false;
+  }
+
+  String old = String(csvPath);
+  sdFs->remove(old.c_str());                         // the data now lives in target
+  strlcpy(csvPath, target.c_str(), sizeof(csvPath));
+  ringValid = false;                                 // the graph reloads from the file
+  redatedRows += changed;
+
+  SLOG.print("[TIME] Re-dated ");
+  SLOG.print(changed);
+  SLOG.print(" records, active file renamed ");
+  SLOG.print(old);
+  SLOG.print(" -> ");
+  SLOG.println(csvPath);
+  return true;
+}
+
 // ============================== PMS5003 ==============================
 
 // Reads one 32-byte frame. The loop re-syncs on the 0x42 0x4D header, so a
@@ -959,6 +1147,7 @@ static bool waitEthernet() {
                       ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLOCK_GPIO0_OUT);
   SLOG.print("[NET] ETH.begin():        ");
   SLOG.println(ok ? "OK" : "FAILED");
+  ethBegan = ok;
   if (!ok) {
     return false;
   }
@@ -1002,6 +1191,7 @@ static bool syncNtp() {
   SLOG.print(settings.ntpServer);
   SLOG.println(")");
   configTime(0, 0, settings.ntpServer);
+  applyTimeZone();             // configTime() would leave TZ at UTC
 
   uint32_t start = millis();
   while (true) {
@@ -1017,6 +1207,87 @@ static bool syncNtp() {
     }
     delay(200);
   }
+}
+
+// Re-checks the Ethernet link in the background. After a power outage the
+// router (and with it DHCP and the uplink) may only be available minutes after
+// the board booted, so the state is not latched in setup() any more. As soon as
+// the interface has an IP the web server is started if it never was, and the
+// NTP retry loop below gets a route to the Internet.
+static void pollNetwork() {
+  uint32_t now = millis();
+  if ((now - lastNetCheck) < NET_RETRY_MS) {
+    return;
+  }
+  lastNetCheck = now;
+
+  if (!ethBegan) {
+    // The PHY itself may have been dead at boot (switch/router without power).
+    ethBegan = ETH.begin(ETH_PHY_LAN8720, ETH_PHY_ADDR, ETH_PHY_MDC,
+                         ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLOCK_GPIO0_OUT);
+    SLOG.print("[NET] ETH.begin() retry:  ");
+    SLOG.println(ethBegan ? "OK" : "FAILED");
+  }
+
+  if (!ethActive && ETH.linkUp() && ETH.localIP() != IPAddress(0, 0, 0, 0)) {
+    ethActive = true;
+    netMode   = "Ethernet";
+    ETH.setDefault();                    // make it the outbound interface
+    SLOG.print("[NET] Ethernet came up late, IP=");
+    SLOG.print(ETH.localIP());
+    SLOG.println(" (DHCP)");
+    if (!webStarted && (ethActive || settings.apEnabled)) {
+      startWebServer();
+    }
+  }
+}
+
+// Retries the NTP synchronisation in the background. Without this a board that
+// booted before the router would keep millis() timestamps for its whole uptime.
+// The first attempts are quick, later ones are spread out to stay quiet.
+static void pollNtp() {
+  if (epochValid()) {                    // real time already known (NTP or manual)
+    ntpPending = false;
+    return;
+  }
+  uint32_t now = millis();
+
+  if (ntpPending) {
+    if (time(nullptr) > (time_t)NTP_EPOCH_MIN) {
+      ntpPending = false;
+      ntpSynced  = true;
+      applyTimeZone();
+      if (bootEpoch == 0) {
+        bootEpoch = (uint32_t)time(nullptr) - (millis() / 1000UL);
+      }
+      SLOG.print("[NTP] Synchronised after retry, epoch=");
+      SLOG.println((uint32_t)time(nullptr));
+      return;
+    }
+    if ((now - ntpTryStartMs) >= NTP_ATTEMPT_TIMEOUT_MS) {
+      ntpPending = false;
+      SLOG.println("[NTP] Retry attempt timed out");
+    }
+    return;
+  }
+
+  if (!ethActive) {                      // no uplink, nothing to ask
+    return;
+  }
+  uint32_t wait = (ntpAttempts < (uint32_t)NTP_RETRY_FAST_ATTEMPTS)
+                  ? NTP_RETRY_MS : NTP_RETRY_SLOW_MS;
+  if (lastNtpTry != 0 && (now - lastNtpTry) < wait) {
+    return;
+  }
+
+  lastNtpTry    = now;
+  ntpTryStartMs = now;
+  ntpAttempts++;
+  ntpPending    = true;
+  configTime(0, 0, settings.ntpServer);
+  applyTimeZone();             // configTime() would leave TZ at UTC
+  SLOG.print("[NTP] Retry #");
+  SLOG.println(ntpAttempts);
 }
 
 // ============================== SAMPLE HANDLING ==============================
@@ -2085,6 +2356,7 @@ static void handleAdminPost() {
     int parsed = sscanf(server.arg("manualtime").c_str(), "%d-%d-%dT%d:%d:%d",
                         &y, &mo, &d, &hh, &mi, &ss);
     if (parsed >= 5) {
+      applyTimeZone();          // the field is local time: mktime() needs the zone
       struct tm t = {};
       t.tm_year  = y - 1900;
       t.tm_mon   = mo - 1;
@@ -2095,8 +2367,6 @@ static void handleAdminPost() {
       t.tm_isdst = -1;
       time_t e = mktime(&t);
       if (e > (time_t)NTP_EPOCH_MIN) {
-        setenv("TZ", TZ_INFO, 1);
-        tzset();
         setManualTime(e);
         message = F("The time has been set.");
       } else {
@@ -2214,6 +2484,9 @@ static void handleStatus() {
   j += ",\"file\":\"";    j += String(csvPath);             j += "\"";
   j += ",\"net\":\"";     j += String(netMode);             j += "\"";
   j += ",\"source\":\"";  j += String(timeSourceName());    j += "\"";
+  j += ",\"ntpAttempts\":"; j += String(ntpAttempts);
+  j += ",\"redated\":";     j += String(redatedRows);
+  j += ",\"ethLink\":";     j += (ETH.linkUp() ? "true" : "false");
   j += ",\"epoch\":";     j += String(epoch);
   j += ",\"time\":\"";    j += String(now);                 j += "\"";
   j += ",\"boot\":\"";    j += String(boot);                j += "\"";
@@ -2565,6 +2838,11 @@ static void handleUpdateUpload() {
 }
 
 static void startWebServer() {
+  if (webStarted) {                      // may be called again when the link
+    return;                              // comes up after a late boot
+  }
+  webStarted = true;
+
   server.on("/", handleRoot);
   server.on("/admin", HTTP_GET,  handleAdminGet);
   server.on("/admin", HTTP_POST, handleAdminPost);
@@ -2600,6 +2878,7 @@ void setup() {
 #endif
 
   loadSettings();
+  applyTimeZone();      // local zone for file names, otherwise UTC after a reset
 
   // ---------- 1. microSD ----------
   sdReady = mountSD();
@@ -2643,8 +2922,7 @@ void setup() {
   if (ethActive) {
     ntpSynced = syncNtp();
     if (ntpSynced) {
-      setenv("TZ", TZ_INFO, 1);
-      tzset();
+      applyTimeZone();
       bootEpoch = (uint32_t)time(nullptr) - (millis() / 1000UL);
       SLOG.print("[NTP] OK, epoch=");
       SLOG.println((uint32_t)time(nullptr));
@@ -2708,6 +2986,20 @@ void loop() {
   if ((nowMs - lastRotCheck) >= 1000UL) {
     lastRotCheck = nowMs;
     checkRotation();
+  }
+
+  // ---- Clock / network watchdog ----
+  // The router may boot after the board, so Ethernet, DHCP and NTP are retried
+  // here instead of only in setup(). When the clock finally becomes valid, the
+  // records written with millis() are re-dated and the file renamed.
+  pollNetwork();
+  pollNtp();
+  if (!timeWasValid && epochValid()) {
+    timeWasValid = true;
+    if (repairActiveFile()) {
+      SLOG.println("[TIME] Early millis records re-dated and file renamed");
+    }
+    rememberRotationDate();       // daily rotation starts from real time
   }
 
   // AM2302 read (sensor supports ~0.5 Hz, so every 3 s is plenty)
