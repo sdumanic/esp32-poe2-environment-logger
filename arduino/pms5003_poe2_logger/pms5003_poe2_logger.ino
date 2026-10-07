@@ -11,9 +11,10 @@
   Web server (port 80) - reachable over Ethernet and over the Wi-Fi AP:
     /               HTML: graph, current values, file list
     /admin          administration: network settings and manual time
-    /api/status     JSON: time, networks, records, current values, OTA
+    /api/status     JSON: time, networks, records, current values, OTA,
+                    file-list version ("filesVer") and free heap
     /api/data       JSON: records for the graph (?f=file or ?from=&to=)
-    /api/files      JSON: files on the card
+    /api/files      JSON: files on the card (cached, see below)
     /download?f=    download a file
     /delete          authenticated POST: delete f (active file is protected)
 
@@ -34,6 +35,16 @@
   Data is written to a separate CSV file per creation date and time:
       /pms_YYYYMMDD_HHMMSS.csv
   The file rotates automatically at midnight (no board restart needed).
+
+  Performance notes:
+    - Listing the card costs about half a second, so it is done once and kept
+      in RAM (FILE_LIST_MAX = 512 newest files). The cache is dropped whenever
+      this program creates, rotates, re-dates or deletes a file, and
+      /api/status publishes that as "filesVer" so the page only reloads the
+      file table when something really changed.
+    - A history query or a CSV range export opens only the files whose span
+      overlaps the requested range, and CSV rows are parsed by hand instead of
+      with sscanf() (a full day is tens of thousands of lines).
 
   OTA: the board can be flashed over the network (ArduinoOTA), no USB:
       arduino-cli upload -p <IP> --fqbn esp32:esp32:esp32wrover \
@@ -273,6 +284,13 @@ enum LogTimeSource : uint8_t {
   LOG_TIME_MANUAL
 };
 
+// Sink used by scanCsvRange(): it receives every matching record plus an opaque
+// context. A plain function pointer is used instead of a function template
+// because the Arduino preprocessor inserts generated prototypes near the top of
+// the sketch, which breaks templates - and this typedef has to be visible to
+// those prototypes, so it lives here with the other types.
+typedef void (*RowSink)(const LogRow &r, void *ctx);
+
 static uint8_t parseTimeSource(const char *source) {
   if (strcmp(source, "MILLIS") == 0) return LOG_TIME_MILLIS;
   if (strcmp(source, "NTP") == 0)    return LOG_TIME_NTP;
@@ -451,23 +469,177 @@ static void ringPush(uint32_t ts, uint16_t a, uint16_t b, uint16_t c,
 
 // Loads a CSV file into the ring (last RING_MAX records). If the ring already
 // holds that file, nothing is read again.
-// Parses one CSV data line into a LogRow; false for headers or bad lines
+// Parses one CSV data line into a LogRow; false for headers or bad lines.
+// Hand written instead of sscanf(): a history query or an export parses a whole
+// day (tens of thousands of lines) and printf-style parsing is a large part of
+// that cost.
 static bool parseCsvLine(const char *line, LogRow &r) {
-  unsigned long ts = 0;
-  unsigned a = 0, b = 0, c = 0;
-  char source[16] = {0};
-  float tf = NAN, hf = NAN;
-  if (sscanf(line, "%lu,%15[^,],%u,%u,%u,%f,%f", &ts, source, &a, &b, &c, &tf, &hf) < 5) {
+  const char *p = line;
+  char *end = nullptr;
+
+  if (*p < '0' || *p > '9') {
+    return false;                                  // header line or junk
+  }
+  unsigned long ts = strtoul(p, &end, 10);
+  if (*end != ',') {
     return false;
   }
+  p = end + 1;
+
+  const char *srcStart = p;
+  while (*p != 0 && *p != ',') {
+    p++;
+  }
+  if (*p != ',') {
+    return false;                                  // no time_source column
+  }
+  size_t srcLen = (size_t)(p - srcStart);
+  if (srcLen > 15) {
+    srcLen = 15;
+  }
+  char source[16];
+  memcpy(source, srcStart, srcLen);
+  source[srcLen] = 0;
+  p++;
+
+  unsigned long value[3];
+  for (int i = 0; i < 3; i++) {
+    if (*p < '0' || *p > '9') {
+      return false;
+    }
+    value[i] = strtoul(p, &end, 10);
+    if (i < 2) {
+      if (*end != ',') {
+        return false;
+      }
+      p = end + 1;
+    } else {
+      p = end;
+    }
+  }
+
   r.ts    = (uint32_t)ts;
-  r.pm1   = (uint16_t)a;
-  r.pm25  = (uint16_t)b;
-  r.pm100 = (uint16_t)c;
-  r.temp  = tf;
-  r.hum   = hf;
+  r.pm1   = (uint16_t)value[0];
+  r.pm25  = (uint16_t)value[1];
+  r.pm100 = (uint16_t)value[2];
+  r.temp  = NAN;
+  r.hum   = NAN;
+
+  // The two environment columns are optional (a file written before the AM2302
+  // existed, or a read that failed, leaves them empty).
+  if (*p == ',') {
+    p++;
+    if (*p != ',' && *p != 0) {
+      float v = strtof(p, &end);
+      if (end != p) {
+        r.temp = v;
+        p = end;
+      }
+    }
+  }
+  if (*p == ',') {
+    p++;
+    if (*p != 0) {
+      float v = strtof(p, &end);
+      if (end != p) {
+        r.hum = v;
+      }
+    }
+  }
+
   r.source = parseTimeSource(source);
   return true;
+}
+
+// Streams every record of one CSV file inside [from,till] to "sink".
+// Records are written in chronological order, so the scan stops at the first
+// record past "till" instead of reading the rest of the file. Returns true
+// when at least one record was handed to the sink.
+static bool scanCsvRange(const char *name, uint32_t from, uint32_t till,
+                         RowSink sink, void *ctx) {
+  File f = sdFs->open(name, FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) {
+      f.close();
+    }
+    return false;
+  }
+
+  bool got = false;
+  char buf[512];
+  size_t pos = 0;
+  int rd;
+  bool stop = false;
+  while (!stop && (rd = f.read((uint8_t *)buf + pos, sizeof(buf) - pos - 1)) > 0) {
+    pos += (size_t)rd;
+    buf[pos] = 0;
+    char *line = buf;
+    char *nl;
+    while ((nl = strchr(line, char(10))) != nullptr) {
+      *nl = 0;
+      LogRow r;
+      if (parseCsvLine(line, r)) {
+        if (till != 0 && r.ts > till) {
+          stop = true;
+          break;
+        }
+        if ((from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
+          sink(r, ctx);
+          got = true;
+        }
+      }
+      line = nl + 1;
+    }
+    if (stop) {
+      break;
+    }
+    size_t rest = pos - (size_t)(line - buf);
+    memmove(buf, line, rest);
+    pos = rest;
+  }
+  if (!stop && pos > 0) {                          // last line without a newline
+    buf[pos] = 0;
+    LogRow r;
+    if (parseCsvLine(buf, r) &&
+        (from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
+      sink(r, ctx);
+      got = true;
+    }
+  }
+  f.close();
+  return got;
+}
+
+// Writes one record as a CSV line into a caller supplied buffer, flushing it
+// through the HTTP connection whenever the buffer fills up.
+struct CsvOut {
+  char    *buf;
+  size_t   cap;
+  size_t   pos;
+  unsigned blocks;          // sendContent() calls since the last delay()
+};
+
+static void sinkCsv(const LogRow &r, void *ctx) {
+  CsvOut *o = (CsvOut *)ctx;
+  char row[128];
+  char tb[16] = "";
+  char hb[16] = "";
+  if (!isnan(r.temp)) { snprintf(tb, sizeof(tb), "%.1f", r.temp); }
+  if (!isnan(r.hum))  { snprintf(hb, sizeof(hb), "%.1f", r.hum);  }
+  snprintf(row, sizeof(row), "%lu,%s,%u,%u,%u,%s,%s\r\n",
+           (unsigned long)r.ts, logTimeSourceName(r.source),
+           r.pm1, r.pm25, r.pm100, tb, hb);
+  size_t lr = strlen(row);
+  if (o->pos + lr > o->cap - 1) {
+    o->buf[o->pos] = 0;
+    server.sendContent(o->buf);
+    if ((++o->blocks & 7) == 0) {   // let the TCP stack drain now and then
+      delay(1);
+    }
+    o->pos = 0;
+  }
+  memcpy(o->buf + o->pos, row, lr);
+  o->pos += lr;
 }
 
 static bool loadIntoRing(const String &file) {
@@ -581,47 +753,91 @@ static int cmpLogRow(const void *a, const void *b) {
   return 0;
 }
 
-// YYYYMMDD from an epoch (local time); 0 when the epoch is not valid
-static int dateKey(uint32_t epoch) {
-  if (epoch < NTP_EPOCH_MIN) {
-    return 0;
-  }
-  struct tm t;
-  time_t tt = (time_t)epoch;
-  localtime_r(&tt, &t);
-  return (t.tm_year + 1900) * 10000 + (t.tm_mon + 1) * 100 + t.tm_mday;
+// ============================ CSV FILE LIST ============================
+//
+// Listing the card costs about half a second (66 directory entries on SD_MMC),
+// and the web UI needs that list for the file table, for a history query and
+// for a range export. It is therefore scanned once, kept in RAM, and dropped
+// whenever this program itself changes the card. Sorted by name, which for
+// /pms_YYYYMMDD_HHMMSS.csv means chronological order.
+#define FILE_LIST_MAX 512
+
+struct FileEntry {
+  char     name[28];        // "/pms_YYYYMMDD_HHMMSS.csv"
+  uint32_t size;
+};
+
+static FileEntry fileList[FILE_LIST_MAX];
+static int       fileListCount     = -1;      // -1 = the cache needs a scan
+static bool      fileListTruncated = false;   // card holds more than FILE_LIST_MAX
+static uint32_t  filesVersion      = 0;       // bumped on every card change
+static uint32_t  fileScanMs        = 0;       // duration of the last full scan
+
+// Marks the cached listing stale and tells the web UI to fetch it again.
+static void fileListInvalidate() {
+  fileListCount = -1;
+  filesVersion++;
 }
 
-// YYYYMMDD from a /pms_YYYYMMDD_HHMMSS.csv name; 0 when the name has no date
-static int fileNameDateKey(const String &name) {
-  int p = name.indexOf(CSV_PREFIX);
-  if (p < 0) {
-    return 0;
+static int fileListEnsure() {
+  if (fileListCount >= 0) {
+    return fileListCount;
   }
-  int s = p + (int)strlen(CSV_PREFIX);
-  if ((int)name.length() < s + 8) {
-    return 0;
-  }
-  for (int i = 0; i < 8; i++) {
-    char ch = name[s + i];
-    if (ch < '0' || ch > '9') {
-      return 0;
+  uint32_t t0 = millis();
+  fileListCount     = 0;
+  fileListTruncated = false;
+
+  File root = sdFs ? sdFs->open("/") : File();
+  if (root && root.isDirectory()) {
+    const size_t prefixLen = strlen(CSV_PREFIX) - 1;   // without the leading slash
+    File f = root.openNextFile();
+    while (f) {
+      if (!f.isDirectory()) {
+        const char *raw = f.name();
+        const char *nm  = (raw[0] == '/') ? raw + 1 : raw;
+        size_t len = strlen(nm);
+        if (len > prefixLen + 4 && strncmp(nm, CSV_PREFIX + 1, prefixLen) == 0 &&
+            strcmp(nm + len - 4, ".csv") == 0) {
+          int idx = fileListCount++;
+          if (idx >= FILE_LIST_MAX) {
+            idx %= FILE_LIST_MAX;                 // a full card keeps the newest
+            fileListTruncated = true;
+          }
+          FileEntry &e = fileList[idx];
+          snprintf(e.name, sizeof(e.name), "/%s", nm);
+          e.size = (uint32_t)f.size();
+        }
+      }
+      f = root.openNextFile();
     }
+    root.close();
   }
-  return name.substring(s, s + 8).toInt();
+
+  if (fileListCount > FILE_LIST_MAX) {                // undo the rolling write
+    std::rotate(fileList, fileList + (fileListCount % FILE_LIST_MAX),
+                fileList + FILE_LIST_MAX);
+    fileListCount = FILE_LIST_MAX;
+  }
+  std::sort(fileList, fileList + fileListCount, [](const FileEntry &a, const FileEntry &b) {
+    return strcmp(a.name, b.name) < 0;
+  });
+  fileScanMs = millis() - t0;
+  return fileListCount;
 }
 
 // Epoch (local time zone) from a /pms_YYYYMMDD_HHMMSS.csv name; 0 if the name
 // has no timestamp (for example /pms_millis_0000123456.csv).
-static uint32_t fileNameEpoch(const String &name) {
-  int p = name.indexOf(CSV_PREFIX);
-  if (p < 0) return 0;
-  int s = p + (int)strlen(CSV_PREFIX);
-  if ((int)name.length() < s + 15) return 0;
-  const char *c = name.c_str() + s;
-  for (int i = 0; i < 8; i++) { if (c[i] < 48 || c[i] > 57) return 0; }
-  if (c[8] != 95) return 0;
-  for (int i = 9; i < 15; i++) { if (c[i] < 48 || c[i] > 57) return 0; }
+static uint32_t fileNameEpoch(const char *name) {
+  const char *p = strstr(name, CSV_PREFIX);
+  if (p == nullptr) return 0;
+  const char *c = p + strlen(CSV_PREFIX);
+  for (int i = 0; i < 15; i++) {
+    if (i == 8) {
+      if (c[i] != '_') return 0;                          // the date/time separator
+    } else if (c[i] < '0' || c[i] > '9') {
+      return 0;
+    }
+  }
 
   struct tm t = {};
   t.tm_year  = (c[0]-48)*1000 + (c[1]-48)*100 + (c[2]-48)*10 + (c[3]-48) - 1900;
@@ -633,6 +849,12 @@ static uint32_t fileNameEpoch(const String &name) {
   t.tm_isdst = -1;
   time_t e = mktime(&t);
   return (e > (time_t)NTP_EPOCH_MIN) ? (uint32_t)e : 0;
+}
+
+// Row sink for a history query: decimated push into the history buffer.
+static void sinkHist(const LogRow &r, void *ctx) {
+  (void)ctx;
+  histPush(r);
 }
 
 static bool loadHistoryRange(uint32_t from, uint32_t till) {
@@ -647,99 +869,31 @@ static bool loadHistoryRange(uint32_t from, uint32_t till) {
   histReset();
   histCacheValid = false;
 
-  String names[64];
-  int    nameCount = 0;
-
-  File root = sdFs->open("/");
-  if (!root || !root.isDirectory()) {
-    return false;
-  }
-  File f = root.openNextFile();
-  while (f && nameCount < 64) {
-    if (!f.isDirectory()) {
-      String name = String(f.name());
-      if (!name.startsWith("/")) {
-        name = "/" + name;
-      }
-      if (name.indexOf(".csv") > 0 && name.indexOf(CSV_PREFIX) >= 0) {
-        names[nameCount++] = name;
-      }
-    }
-    f = root.openNextFile();
-  }
-  root.close();
+  const int n = fileListEnsure();   // cached listing: one scan for many queries
 
   // Timestamped names sort chronologically, so a file covers the span from its
   // own creation until the next file starts. Only files whose span overlaps the
   // requested range are actually read - this is what keeps queries fast.
-  std::sort(names, names + nameCount, [](const String &a, const String &b) { return a < b; });
-
-  String candidates[64];
-  int    candidateCount = 0;
-  for (int i = 0; i < nameCount && candidateCount < 64; i++) {
-    uint32_t start = fileNameEpoch(names[i]);
-    uint32_t end   = (i + 1 < nameCount) ? fileNameEpoch(names[i + 1]) : 0;
+  for (int i = 0; i < n; i++) {
+    const char *name = fileList[i].name;
+    uint32_t start = fileNameEpoch(name);
+    uint32_t end   = (i + 1 < n) ? fileNameEpoch(fileList[i + 1].name) : 0;
 
     if (start == 0) {
-      if (from == 0) { candidates[candidateCount++] = names[i]; }   // MILLIS era file
-      continue;
-    }
-    if (from >= NTP_EPOCH_MIN) {
+      if (from != 0) continue;                   // MILLIS era file, no wall clock
+    } else if (from >= NTP_EPOCH_MIN) {
       if (end != 0 && end <= from) continue;     // this file ended before the range
       if (till != 0 && start > till) continue;   // this file starts after the range
     }
-    candidates[candidateCount++] = names[i];
-  }
 
-  for (int i = 0; i < candidateCount; i++) {
     uint32_t before = histTotal;
-    File g = sdFs->open(candidates[i], FILE_READ);
-    if (!g) {
-      continue;
-    }
-    char buf[512];
-    size_t pos = 0;
-    int rd;
-    bool stop = false;
-    while (!stop && (rd = g.read((uint8_t *)buf + pos, sizeof(buf) - pos - 1)) > 0) {
-      pos += (size_t)rd;
-      buf[pos] = 0;
-      char *line = buf;
-      char *nl;
-      while ((nl = strchr(line, char(10))) != nullptr) {
-        *nl = 0;
-        if (line[0] >= 48 && line[0] <= 57) {
-          LogRow r;
-          if (parseCsvLine(line, r)) {
-            if (till != 0 && r.ts > till) { stop = true; break; }   // chronological file
-            if ((from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
-              histPush(r);
-            }
-          }
-        }
-        line = nl + 1;
-      }
-      if (stop) break;
-      size_t rest = pos - (size_t)(line - buf);
-      memmove(buf, line, rest);
-      pos = rest;
-    }
-    if (!stop && pos > 0) {
-      buf[pos] = 0;
-      if (buf[0] >= 48 && buf[0] <= 57) {
-        LogRow r;
-        if (parseCsvLine(buf, r) && (from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
-          histPush(r);
-        }
-      }
-    }
-    g.close();
+    scanCsvRange(name, from, till, sinkHist, nullptr);
 
     if (histTotal > before && histFiles.length() < 120) {
       if (histFiles.length() > 0) {
         histFiles += ",";
       }
-      histFiles += candidates[i];
+      histFiles += name;
     }
   }
 
@@ -800,6 +954,7 @@ static bool prepareCsv() {
   }
   f.println("timestamp,time_source,pm1_0,pm2_5,pm10,temp_c,humidity");
   f.close();
+  fileListInvalidate();                 // the new file appears in the file list
   SLOG.print("[SD] Created file with header: ");
   SLOG.println(csvPath);
   return true;
@@ -836,6 +991,7 @@ static void rotateFile() {
   if (sdReady) {
     prepareCsv();
   }
+  fileListInvalidate();                 // the active file (and the list) changed
 
   rotDay   = t.tm_mday;
   rotMonth = t.tm_mon;
@@ -1041,6 +1197,7 @@ static bool repairActiveFile() {
   sdFs->remove(old.c_str());                         // the data now lives in target
   strlcpy(csvPath, target.c_str(), sizeof(csvPath));
   ringValid = false;                                 // the graph reloads from the file
+  fileListInvalidate();                              // old name gone, new one added
   redatedRows += changed;
 
   SLOG.print("[TIME] Re-dated ");
@@ -1639,6 +1796,8 @@ var currentTheme = "light";
 var allFiles = [];
 var filePage = 1;
 var filesPerPage = 15;
+var lastFilesVer = -1;              // /api/status "filesVer": file list changed?
+var lastStatus = null;              // last /api/status payload (reused below)
 
 function q(id){ return document.getElementById(id); }
 function getJSON(u){ return fetch(u, {cache:"no-store"}).then(function(r){ return r.json(); }); }
@@ -1690,6 +1849,11 @@ function applyRange(){
 
 function pollStatus(){
   getJSON("/api/status").then(function(s){
+    lastStatus = s;
+    if (s.filesVer !== undefined && s.filesVer !== lastFilesVer) {
+      lastFilesVer = s.filesVer;      // the card changed: refresh the file table
+      loadFiles();
+    }
     q("clock").textContent = s.time;
     q("tsrc").textContent  = s.source;
     q("recs").textContent  = s.records;
@@ -1764,19 +1928,22 @@ function renderDhtState(s){
   el.textContent = txt;
 }
 
-function pollCurrent(){
-  getJSON("/api/status").then(function(s){
-    if (s.current) {
-      q("c1").textContent  = s.current.pm1;
-      q("c25").textContent = s.current.pm25;
-      q("c10").textContent = s.current.pm100;
-      q("ctemp").textContent = (s.current.temp === null || s.current.temp === undefined) ? "-" : s.current.temp;
-      q("chum").textContent  = (s.current.hum  === null || s.current.hum  === undefined) ? "-" : s.current.hum;
-      q("cdew").textContent  = (s.current.temp === null || s.current.temp === undefined || s.current.hum === null || s.current.hum === undefined)
-                               ? "-" : dewPoint(parseFloat(s.current.temp), parseFloat(s.current.hum)).toFixed(1);
-    }
-    q("cupd").textContent = "read at: " + s.time + " (every 5 s)";
-  }).catch(function(){});
+/* Refreshes the value tiles every 5 s from the last /api/status payload: the
+   same numbers arrive with the 2 s status poll, so a second request per tick
+   would only add traffic. */
+function renderCurrent(){
+  var s = lastStatus;
+  if (!s) { return; }
+  if (s.current) {
+    q("c1").textContent  = s.current.pm1;
+    q("c25").textContent = s.current.pm25;
+    q("c10").textContent = s.current.pm100;
+    q("ctemp").textContent = (s.current.temp === null || s.current.temp === undefined) ? "-" : s.current.temp;
+    q("chum").textContent  = (s.current.hum  === null || s.current.hum  === undefined) ? "-" : s.current.hum;
+    q("cdew").textContent  = (s.current.temp === null || s.current.temp === undefined || s.current.hum === null || s.current.hum === undefined)
+                             ? "-" : dewPoint(parseFloat(s.current.temp), parseFloat(s.current.hum)).toFixed(1);
+  }
+  q("cupd").textContent = "read at: " + s.time + " (every 5 s)";
 }
 
 function loadRange(){
@@ -2124,7 +2291,6 @@ function draw(){
     envTxt += "  |  dew point (avg): " + dewPoint(tavg, havg).toFixed(1) + " \u00b0C";
   }
   q("chartinfoEnv").textContent = envTxt;
-  q("chartinfoEnv").textContent = "temperature / humidity: " + withEnv + " of " + d.length + " records";
 }
 
 function exportPNG(){
@@ -2257,11 +2423,9 @@ window.addEventListener("load", function(){
   });
 
   pollStatus();
-  pollCurrent();
   loadFiles();
   setInterval(pollStatus, 2000);    // graph on change + networks + time
-  setInterval(pollCurrent, 5000);   // current values
-  setInterval(loadFiles, 15000);    // file list
+  setInterval(renderCurrent, 5000); // current values (from the last status poll)
   window.addEventListener("resize", draw);
 });
 </script>
@@ -2551,6 +2715,10 @@ static void rowJson(char *out, size_t n, const LogRow &r, bool first) {
            logTimeSourceName(r.source));
 }
 
+static const char *jsonBool(bool v) {
+  return v ? "true" : "false";
+}
+
 static void handleStatus() {
   char now[32];
   char boot[24];
@@ -2559,60 +2727,74 @@ static void handleStatus() {
 
   uint32_t epoch = epochValid() ? (uint32_t)time(nullptr) : 0;
 
-  String j = "{";
-  j += "\"records\":";    j += String(recordCount);
-  j += ",\"file\":\"";    j += String(csvPath);             j += "\"";
-  j += ",\"net\":\"";     j += String(netMode);             j += "\"";
-  j += ",\"source\":\"";  j += String(timeSourceName());    j += "\"";
-  j += ",\"ntpAttempts\":"; j += String(ntpAttempts);
-  j += ",\"redated\":";     j += String(redatedRows);
-  j += ",\"ethLink\":";     j += (ETH.linkUp() ? "true" : "false");
-  j += ",\"epoch\":";     j += String(epoch);
-  j += ",\"time\":\"";    j += String(now);                 j += "\"";
-  j += ",\"boot\":\"";    j += String(boot);                j += "\"";
-  j += ",\"uptime\":";    j += String((uint32_t)(millis() / 1000UL));
-  j += ",\"ageSec\":";    j += String((uint32_t)((millis() - lastPmsMs) / 1000UL));
-  j += ",\"framesOk\":";  j += String(framesOk);
-  j += ",\"framesBad\":"; j += String(framesBad);
-  j += ",\"dhtOk\":";     j += (dhtEverOk ? "true" : "false");
-  j += ",\"dhtGood\":";   j += String(dhtGood);
-  j += ",\"dhtBad\":";    j += String(dhtBad);
-  j += ",\"dhtAgeSec\":"; j += (dhtEverOk ? String((uint32_t)((millis() - dhtLastGoodMs) / 1000UL)) : String(-1));
-
-  // Wired network
-  j += ",\"ethActive\":"; j += (ethActive ? "true" : "false");
-  j += ",\"ethDhcp\":";   j += (settings.ethDhcp ? "true" : "false");
-  j += ",\"ethIp\":\"";   j += (ethActive ? ETH.localIP().toString()     : String("-")); j += "\"";
-  j += ",\"ethMask\":\""; j += (ethActive ? ETH.subnetMask().toString()  : String("-")); j += "\"";
-  j += ",\"ethGw\":\"";   j += (ethActive ? ETH.gatewayIP().toString()   : String("-")); j += "\"";
-  j += ",\"ethMac\":\"";  j += ETH.macAddress(); j += "\"";
-
-  // Wireless network (AP)
-  j += ",\"apEnabled\":";  j += (settings.apEnabled ? "true" : "false");
-  j += ",\"apSsid\":\"";   j += String(settings.apSsid); j += "\"";
-  j += ",\"apIp\":\"";     j += (settings.apEnabled ? WiFi.softAPIP().toString() : String("-")); j += "\"";
-  j += ",\"apChannel\":";  j += String(settings.apChannel);
-  j += ",\"apClients\":";  j += String((uint32_t)(settings.apEnabled ? WiFi.softAPgetStationNum() : 0));
-
+  // Formatted straight into one buffer: this endpoint is polled every two
+  // seconds, and dozens of String concatenations per request would churn the
+  // heap for no benefit. Only the values the ESP32 API returns as String are
+  // materialised.
+  String macS  = ETH.macAddress();
+  String ipS   = ethActive ? ETH.localIP().toString()      : String("-");
+  String maskS = ethActive ? ETH.subnetMask().toString()   : String("-");
+  String gwS   = ethActive ? ETH.gatewayIP().toString()    : String("-");
+  String apIpS = settings.apEnabled ? WiFi.softAPIP().toString() : String("-");
+  const char *otaName =
 #if OTA_ENABLE
-  j += ",\"ota\":\"";      j += String(OTA_HOSTNAME);  j += "\"";
+      OTA_HOSTNAME;
 #else
-  j += ",\"ota\":\"disabled\"";
+      "disabled";
 #endif
-  j += ",\"theme\":\"";   j += String(settings.theme); j += "\"";
 
-  j += ",\"current\":{";
-  if (haveSample) {
-    j += "\"ts\":";      j += String(lastTs);
-    j += ",\"pm1\":";    j += String(lastPm1);
-    j += ",\"pm25\":";   j += String(lastPm25);
-    j += ",\"pm100\":";  j += String(lastPm100);
-    j += ",\"temp\":";   j += (isnan(dhtTempC)    ? String("null") : String(dhtTempC, 1));
-    j += ",\"hum\":";    j += (isnan(dhtHumidity) ? String("null") : String(dhtHumidity, 1));
-  } else {
-    j += "\"ts\":0,\"pm1\":\"-\",\"pm25\":\"-\",\"pm100\":\"-\",\"temp\":null,\"hum\":null";
+  char j[1400];
+  int n = snprintf(
+      j, sizeof(j),
+      "{\"records\":%lu,\"file\":\"%s\",\"net\":\"%s\",\"source\":\"%s\","
+      "\"ntpAttempts\":%lu,\"redated\":%lu,\"ethLink\":%s,\"epoch\":%lu,"
+      "\"time\":\"%s\",\"boot\":\"%s\",\"uptime\":%lu,\"ageSec\":%lu,"
+      "\"framesOk\":%lu,\"framesBad\":%lu,\"dhtOk\":%s,\"dhtGood\":%lu,"
+      "\"dhtBad\":%lu,\"dhtAgeSec\":%ld,\"filesVer\":%lu,\"heap\":%lu,"
+      "\"ethActive\":%s,\"ethDhcp\":%s,\"ethIp\":\"%s\",\"ethMask\":\"%s\","
+      "\"ethGw\":\"%s\",\"ethMac\":\"%s\","
+      "\"apEnabled\":%s,\"apSsid\":\"%s\",\"apIp\":\"%s\",\"apChannel\":%u,"
+      "\"apClients\":%u,\"ota\":\"%s\",\"theme\":\"%s\",\"current\":",
+      (unsigned long)recordCount, csvPath, netMode, timeSourceName(),
+      (unsigned long)ntpAttempts, (unsigned long)redatedRows,
+      jsonBool(ETH.linkUp()), (unsigned long)epoch, now, boot,
+      (unsigned long)(millis() / 1000UL),
+      (unsigned long)((millis() - lastPmsMs) / 1000UL),
+      (unsigned long)framesOk, (unsigned long)framesBad, jsonBool(dhtEverOk),
+      (unsigned long)dhtGood, (unsigned long)dhtBad,
+      (long)(dhtEverOk ? (long)((millis() - dhtLastGoodMs) / 1000UL) : -1L),
+      (unsigned long)filesVersion, (unsigned long)ESP.getFreeHeap(),
+      jsonBool(ethActive), jsonBool(settings.ethDhcp), ipS.c_str(),
+      maskS.c_str(), gwS.c_str(), macS.c_str(),
+      jsonBool(settings.apEnabled), settings.apSsid, apIpS.c_str(),
+      (unsigned)settings.apChannel,
+      (unsigned)(settings.apEnabled ? WiFi.softAPgetStationNum() : 0),
+      otaName, settings.theme);
+
+  if (n < 0 || n >= (int)sizeof(j)) {
+    server.send(500, "text/plain", "status too long");
+    return;
   }
-  j += "}}";
+
+  if (haveSample) {
+    char tt[16] = "null";
+    char hh[16] = "null";
+    if (!isnan(dhtTempC))    { snprintf(tt, sizeof(tt), "%.1f", dhtTempC); }
+    if (!isnan(dhtHumidity)) { snprintf(hh, sizeof(hh), "%.1f", dhtHumidity); }
+    n += snprintf(j + n, sizeof(j) - n,
+                  "{\"ts\":%lu,\"pm1\":%u,\"pm25\":%u,\"pm100\":%u,"
+                  "\"temp\":%s,\"hum\":%s}}",
+                  (unsigned long)lastTs, (unsigned)lastPm1, (unsigned)lastPm25,
+                  (unsigned)lastPm100, tt, hh);
+  } else {
+    n += snprintf(j + n, sizeof(j) - n,
+                  "{\"ts\":0,\"pm1\":\"-\",\"pm25\":\"-\",\"pm100\":\"-\","
+                  "\"temp\":null,\"hum\":null}}");
+  }
+  if (n < 0 || n >= (int)sizeof(j)) {
+    server.send(500, "text/plain", "status too long");
+    return;
+  }
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", j);
@@ -2650,7 +2832,7 @@ static void handleData() {
     server.sendContent(buf);
 
     char row[96];
-    char out[1100];
+    char out[2048];
     size_t pos = 0;
     for (int i = 0; i < histCount; i++) {
       rowJson(row, sizeof(row), histBuf[i], (i == 0));
@@ -2700,7 +2882,7 @@ static void handleData() {
   server.sendContent(buf);
 
   char row[96];
-  char out[1100];
+  char out[2048];
   size_t pos = 0;
   for (int i = 0; i < ringCount; i++) {
     LogRow r = ring[(ringHead + i) % RING_MAX];
@@ -2729,35 +2911,45 @@ static void handleFiles() {
     return;
   }
 
-  server.sendHeader("Cache-Control", "no-store");
-  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-  server.send(200, "application/json", "");
-  server.sendContent("{\"files\":[");
+  // The table only changes when this program writes to the card, so the JSON is
+  // rebuilt on a version change instead of scanning the directory on every
+  // request (a scan costs about half a second, and the page polls this list).
+  static String   cachedJson;
+  static uint32_t cachedVersion = 0;
+  static bool     cachedValid   = false;
 
-  File root = sdFs->open("/");
-  if (root && root.isDirectory()) {
-    bool first = true;
-    File f = root.openNextFile();
-    while (f) {
-      if (!f.isDirectory()) {
-        String name = String(f.name());
-        if (!name.startsWith("/")) {
-          name = "/" + name;
-        }
-        char buf[160];
-        snprintf(buf, sizeof(buf), "%s{\"name\":\"%s\",\"size\":%lu,\"active\":%s}",
-                 (first ? "" : ","), name.c_str(), (unsigned long)f.size(),
-                 (name == String(csvPath)) ? "true" : "false");
-        server.sendContent(buf);
-        first = false;
+  if (!cachedValid || cachedVersion != filesVersion) {
+    const int n = fileListEnsure();
+    cachedJson  = "";
+    cachedJson.reserve(96 + n * 72);
+    cachedJson += "{\"version\":";
+    cachedJson += String(filesVersion);
+    cachedJson += ",\"count\":";
+    cachedJson += String(n);
+    cachedJson += ",\"truncated\":";
+    cachedJson += (fileListTruncated ? "true" : "false");
+    cachedJson += ",\"scanMs\":";
+    cachedJson += String(fileScanMs);
+    cachedJson += ",\"files\":[";
+    for (int i = 0; i < n; i++) {
+      if (i > 0) {
+        cachedJson += ",";
       }
-      f = root.openNextFile();
+      cachedJson += "{\"name\":\"";
+      cachedJson += fileList[i].name;
+      cachedJson += "\",\"size\":";
+      cachedJson += String((unsigned long)fileList[i].size);
+      cachedJson += ",\"active\":";
+      cachedJson += (strcmp(fileList[i].name, csvPath) == 0 ? "true" : "false");
+      cachedJson += "}";
     }
-    root.close();
+    cachedJson += "]}";
+    cachedVersion = filesVersion;
+    cachedValid   = true;
   }
 
-  server.sendContent("]}");
-  server.sendContent("");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", cachedJson);
 }
 
 static void handleDownload() {
@@ -2810,6 +3002,7 @@ static void handleDelete() {
   if (ringValid && ringFile == file) {
     ringValid = false;
   }
+  fileListInvalidate();
   SLOG.print("[WEB] Deleted file: ");
   SLOG.println(file);
 
@@ -2825,35 +3018,6 @@ static void nameStamp(uint32_t e, char *out, size_t n) {
   localtime_r(&tt, &t);
   snprintf(out, n, "%04d%02d%02d_%02d%02d%02d",
            t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
-}
-
-// Finds the lexicographically next CSV file without keeping a fixed-size list
-// in RAM. Repeated directory scans are slower than an array, but this keeps the
-// export complete even after years of daily files and uses constant memory.
-static bool nextCsvNameAfter(const String &after, String &next) {
-  next = "";
-  File root = sdFs->open("/");
-  if (!root || !root.isDirectory()) {
-    if (root) root.close();
-    return false;
-  }
-
-  File f = root.openNextFile();
-  while (f) {
-    if (!f.isDirectory()) {
-      String name = String(f.name());
-      if (!name.startsWith("/")) name = "/" + name;
-      if (name.startsWith(CSV_PREFIX) && name.endsWith(".csv") &&
-          (after.length() == 0 || name > after) &&
-          (next.length() == 0 || name < next)) {
-        next = name;
-      }
-    }
-    f.close();
-    f = root.openNextFile();
-  }
-  root.close();
-  return next.length() > 0;
 }
 
 // Downloads every record of the requested range as a CSV file. This deliberately
@@ -2879,79 +3043,27 @@ static void handleExport() {
   server.send(200, "text/csv", "");
   server.sendContent("timestamp,time_source,pm1_0,pm2_5,pm10,temp_c,humidity\r\n");
 
-  char row[128];
-  char out[1100];
-  size_t pos = 0;
+  char out[2048];
+  CsvOut sink = { out, sizeof(out), 0, 0 };
 
-  auto emitRow = [&](const LogRow &r) {
-    const char *src = logTimeSourceName(r.source);
-    char tb[16] = "";
-    char hb[16] = "";
-    if (!isnan(r.temp)) { snprintf(tb, sizeof(tb), "%.1f", r.temp); }
-    if (!isnan(r.hum))  { snprintf(hb, sizeof(hb), "%.1f", r.hum);  }
-    snprintf(row, sizeof(row), "%lu,%s,%u,%u,%u,%s,%s\r\n",
-             (unsigned long)r.ts, src, r.pm1, r.pm25, r.pm100, tb, hb);
-    size_t lr = strlen(row);
-    if (pos + lr > sizeof(out) - 1) {
-      out[pos] = 0;
-      server.sendContent(out);
-      delay(1);
-      pos = 0;
+  // Only the files whose span overlaps the range are opened. The listing is
+  // cached and chronological, so a range that covers one day reads one file
+  // instead of scanning the directory once per file.
+  const int n = fileListEnsure();
+  for (int i = 0; i < n; i++) {
+    const char *name = fileList[i].name;
+    uint32_t start = fileNameEpoch(name);
+    if (start == 0) {
+      if (from != 0) continue;                 // MILLIS era file, no wall clock
+    } else if (from >= NTP_EPOCH_MIN) {
+      uint32_t end = (i + 1 < n) ? fileNameEpoch(fileList[i + 1].name) : 0;
+      if (end != 0 && end <= from) continue;   // this file ended before the range
+      if (till != 0 && start > till) break;    // the listing is chronological
     }
-    memcpy(out + pos, row, lr);
-    pos += lr;
-  };
-
-  String previous = "";
-  String fileName;
-  while (nextCsvNameAfter(previous, fileName)) {
-    previous = fileName;
-    File f = sdFs->open(fileName, FILE_READ);
-    if (!f || f.isDirectory()) {
-      if (f) f.close();
-      continue;
-    }
-
-    char input[512];
-    size_t inputPos = 0;
-    int rd;
-    bool stopFile = false;
-    while (!stopFile && (rd = f.read((uint8_t *)input + inputPos,
-                                     sizeof(input) - inputPos - 1)) > 0) {
-      inputPos += (size_t)rd;
-      input[inputPos] = 0;
-      char *line = input;
-      char *nl;
-      while ((nl = strchr(line, char(10))) != nullptr) {
-        *nl = 0;
-        if (line[0] >= '0' && line[0] <= '9') {
-          LogRow r;
-          if (parseCsvLine(line, r)) {
-            if (till != 0 && r.ts > till) { stopFile = true; break; }
-            if ((from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
-              emitRow(r);
-            }
-          }
-        }
-        line = nl + 1;
-      }
-      if (stopFile) break;
-      size_t rest = inputPos - (size_t)(line - input);
-      memmove(input, line, rest);
-      inputPos = rest;
-    }
-    if (!stopFile && inputPos > 0) {
-      input[inputPos] = 0;
-      LogRow r;
-      if (parseCsvLine(input, r) &&
-          (from == 0 || r.ts >= from) && (till == 0 || r.ts <= till)) {
-        emitRow(r);
-      }
-    }
-    f.close();
+    scanCsvRange(name, from, till, sinkCsv, &sink);
   }
-  if (pos > 0) {
-    out[pos] = 0;
+  if (sink.pos > 0) {
+    out[sink.pos] = 0;
     server.sendContent(out);
   }
   server.sendContent("");

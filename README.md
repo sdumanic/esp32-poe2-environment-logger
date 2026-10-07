@@ -12,6 +12,12 @@ filters (last 5 min by default, plus a custom from-to range), a live view of the
 active file, CSV download of the selected range, current values with the sensor
 freshness indicator, and the file list with download/delete actions.*
 
+> **First login:** the administration page `/admin` and every action that
+> changes the device (settings, file deletion, firmware update) is protected
+> with HTTP Basic authentication. The factory credentials are user **`admin`**,
+> password **`pms5003admin`** - change the password right away on `/admin`
+> (section *Administration password*).
+
 ## Hardware
 
 | Part | Details |
@@ -63,16 +69,26 @@ GPIO0 (ETH clock), GPIO14/15/2 (SD), GPIO1/3 (USB serial), GPIO34-39 (input only
 - Quick ranges only fill the From/To fields; the chart is (re)drawn on **Apply
   range** and, in Live view, on every new record. Browsing history therefore never
   slows down logging, and a CSV download never touches the chart.
-- History queries read the first 64 files covering the selected range, merge and
-  sort them, and decimate evenly when there are more than 1200 records. CSV range
-  export is independent of that chart buffer and always streams every matching
-  record from every CSV file.
+- The card is listed once and cached in RAM (`FILE_LIST_MAX`, the newest 512
+  files); the cache is dropped whenever the program creates, rotates, re-dates or
+  deletes a file. `/api/status` publishes that as `filesVer`, and the page reloads
+  the file table only when it changes, so keeping the list open costs no SD time.
+- History queries open only the files whose span overlaps the selected range,
+  merge and sort them, and decimate evenly when there are more than 1200 records.
+  The CSV range export is independent of that chart buffer and streams every
+  matching record of those files in a single pass (a download that used to take
+  about 30 s now finishes well under a second).
+- CSV rows are parsed by hand instead of with `sscanf()`, which roughly halves the
+  cost of reading a file.
 - The file list shows the newest 15 files per page with page navigation.
 - The environment chart uses two axes (temperature on the left with an auto
   range, humidity 0-100 % on the right) and the caption shows min/avg/max plus
   the dew point; the current dew point is also shown on a tile.
 - The help modal includes reference values for temperature, humidity and dew
   point (comfort, mould risk, condensation).
+- The current-value tiles refresh every 5 s from the last `/api/status` response
+  instead of starting a second request, and the environment summary under the
+  lower chart shows min/avg/max plus the average dew point.
 - Three selectable themes: light, dark and high contrast (chart and PNG export
   follow the selected theme).
 - **Administration** at `/admin`: network settings (Ethernet, AP, NTP), manual
@@ -100,10 +116,10 @@ MANUAL), otherwise `millis()`.
 |---|---|
 | `/` | HTML page with the chart |
 | `/admin` | administration (GET shows the form, POST saves) |
-| `/api/status` | JSON: time, networks, records, current values, theme, OTA name, NTP retry counter and re-dated record count |
+| `/api/status` | JSON: time, networks, records, current values, theme, OTA name, NTP retry counter, re-dated record count, file-list version (`filesVer`) and free heap |
 | `/api/data?f=` | JSON records of a single file |
 | `/api/data?from=&to=` | JSON records across all files covering a range |
-| `/api/files` | JSON list of files on the card |
+| `/api/files` | JSON list of files on the card (cached; `version`, `count`, `truncated`, `scanMs`) |
 | `/download?f=` | download a file |
 | `/delete` | delete a file using authenticated POST form data `f` (the active one is protected) |
 | `/export?from=&to=` | CSV download of the records in a range (chart untouched) |
