@@ -606,23 +606,8 @@ function renderFiles(){
 
     var td3 = document.createElement("td");
 
-    var a1 = document.createElement("a");
-    a1.textContent = "graph";
-    a1.href = "#";
-    a1.onclick = function(e){
-      e.preventDefault();
-      selFile = f.name;
-      mode = "file";
-      fromEpoch = 0; tillEpoch = 0; rangeSec = 0; rangeFrom = 0; rangeTill = 0;
-      q("from").value = ""; q("till").value = ""; q("range").value = "0";
-      lastCount = -1;
-      liveSince = 0;                        // a different file: full reload
-      q("file").textContent = selFile;
-      loadData();
-    };
-    td3.appendChild(a1);
-    td3.appendChild(document.createTextNode(" | "));
-
+    // No per-file "graph" link: the chart is driven by the From/To range filter
+    // and by Live (the active file) instead.
     var a2 = document.createElement("a");
     a2.textContent = "download";
     a2.href = "/download?f=" + encodeURIComponent(f.name);
